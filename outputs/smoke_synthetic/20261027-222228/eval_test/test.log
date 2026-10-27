@@ -1,0 +1,39 @@
+module               on       params    trainable
+--------------------------------------------------
+encoder             yes    1,059,936      899,232
+lora                yes       15,360       15,360
+decoder             yes      435,968      435,968
+shift_estimator     yes      231,360      231,360
+prototypes          yes      131,224      131,224
+head                yes            0            0
+prototype terms: anchors + memory + shift_library   head: cosine (tau=0.070)
+LoRA layers: 6
+[data] train:     54 samples, 6 domains
+[data] test :     24 samples, 2 domains
+[data] val  :     18 samples, 6 domains
+
+================ TEST (24 images) ================
+mIoU 55.55 | IoU(fw) 87.87 | BIoU 54.23 | Dice 65.04 | pixel acc 93.37 | mean acc 62.14
+    class              IoU      F1    BIoU    Prec     Rec
+    road             93.17   96.46   90.00   96.53   96.39
+    sidewalk         91.80   95.72   89.23   93.90   97.62
+    building         84.79   91.77   82.30   89.82   93.80
+    wall              -       -       -       -       -   
+    fence             -       -       -       -       -   
+    pole             23.18   37.64   23.18   48.44   30.77
+    traffic light     -       -       -       -       -   
+    traffic sign     19.88   33.17   19.88   75.77   21.23
+    vegetation       37.25   54.28   36.65   93.01   38.33
+    terrain           -       -       -       -       -   
+    sky              96.03   97.98   94.55   96.27   99.75
+    person           35.44   52.34   35.41   83.48   38.12
+    rider             -       -       -       -       -   
+    car              69.04   81.69   66.24   70.71   96.71
+    truck             -       -       -       -       -   
+    bus               -       -       -       -       -   
+    train             -       -       -       -       -   
+    motorcycle        -       -       -       -       -   
+    bicycle           4.91    9.36    4.91   10.14    8.70
+per-domain mIoU: frankfurt 45.68, lindau 72.66
+continual: avg_final 63.06, avg_incremental 57.24, BWT 5.51, avg_forgetting -3.15, FWT_zero_shot 43.93
+[test] figures: test_classwise_iou_f1.png, test_confusion_matrix.png, test_per_domain_miou.png, test_samples.png, test_tsne_classes.png, test_tsne_domains.png

@@ -1,0 +1,169 @@
+# ---------------------------------------------------------------------------
+# Defaults for every dataset. A dataset config starts with `_base_: defaults.yaml`
+# and overrides only what it needs. Any key can also be overridden from the CLI:
+#   python tools/train.py --config configs/cityscapes.yaml --opts train.lr=3e-4
+# ---------------------------------------------------------------------------
+
+experiment:
+  name: default
+  output_dir: outputs          # run dir = output_dir/<name>/<timestamp>
+  seed: 42
+  device: cuda                 # cuda | cpu
+  amp: true                    # mixed precision on cuda
+  deterministic: false
+
+dataset:
+  name: null
+  root: null                   # dataset directory
+  classes: []                  # train-id order; num_classes = len(classes)
+  palette: null                # [[r,g,b], ...] per class; auto-generated if null
+  ignore_index: 255
+  source:
+    mode: glob                 # glob | list
+    image_glob: null           # relative to root; {split} is substituted
+    label_from_image: []       # [[old, new], ...] replacements: image rel-path -> label rel-path
+    label_glob: null           # alternative to label_from_image: sorted pairing with image_glob
+    list_file: null            # mode=list: text file, one "image_rel label_rel" per line; {split} substituted
+    domain_regex: null         # regex, group 1 = domain (city/site/scanner) from the image rel-path
+  label_map: null              # {raw_id: train_id}; unlisted ids -> ignore. null = labels already train ids
+  reduce_zero_label: false     # ADE20K style: 0 -> ignore, others -1
+
+# Which samples form train / val / test. Each split either reads a physical
+# folder split (`split:`) or is carved out of another split (`from:` + `fraction:`).
+splits:
+  train: {split: train, domains: all}
+  val:   {from: train, fraction: 0.1, per_domain: true}
+  test:  {split: val, domains: all}
+  max_samples: {train: null, val: null, test: null}   # cap for quick runs
+
+# Joint image/mask transforms, applied in order. See drift/data/transforms.py
+transforms:
+  train:
+    - {name: RandomScale, scale: [0.5, 2.0]}
+    - {name: RandomCrop, size: [512, 512]}
+    - {name: HorizontalFlip, p: 0.5}
+    - {name: ColorJitter, brightness: 0.25, contrast: 0.25, saturation: 0.25, hue: 0.0, p: 0.8}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+  val:
+    - {name: Resize, size: [512, 1024]}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+  test:
+    - {name: Resize, size: [512, 1024]}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+
+# Domain-incremental schedule. Each task is a list of domains (cities).
+# continual.enabled=false trains one task on all train domains (plain segmentation).
+continual:
+  enabled: true
+  tasks: auto                  # auto | [[city_a], [city_b, city_c], ...]
+  group_size: 1                # auto: domains per task
+  order: sorted                # auto: sorted | random | as_found
+  num_tasks: null              # keep only the first N tasks
+  valid_set: task              # classes allowed in the softmax while training: task | batch | all
+  task_overrides: {}           # {task_index: {train: {lr: ..., epochs: ...}, loss: {...}}}
+
+model:
+  name: drift
+  embed_dim: 256               # z(p) dimension
+  shift_dim: 64                # s dimension
+  # Ablation switches. false = module is not built: no params, no forward, no gradient.
+  modules:
+    lora: true                 # LoRA adapters inside the frozen encoder
+    cosine_head: true          # cosine-to-prototype head; false = plain 1x1 linear classifier
+    anchors: true              # a_c frozen text/fixed anchors in the prototype
+    memory: true               # m_c memory slots in the prototype
+    shift_estimator: true      # g_phi: encoder stats -> s
+    shift_library: true        # U_c B s term in the prototype (needs shift_estimator)
+    learnable_base: false      # extra learnable per-class vector w_c in the prototype
+  encoder:
+    name: segformer            # segformer | simple_cnn
+    pretrained: nvidia/mit-b2  # HF id or local path
+    freeze: true
+  lora:
+    rank: 8
+    alpha: 16
+    dropout: 0.0
+    targets: [query, key, value]
+  decoder:
+    dropout: 0.1
+  shift_estimator:
+    hidden: 256
+    use_std: true
+    detach_input: false
+  prototypes:
+    anchors:
+      source: random           # random | file | clip
+      file: null               # .pt tensor [C, D] (see tools/make_anchors.py)
+      clip_model: openai/clip-vit-base-patch32
+      template: "a photo of a {} in a city street"
+    memory:
+      num_slots: 1             # K slots per class; written round-robin per task
+      momentum: 0.0            # EMA momentum when a slot is overwritten (0 = take the new mean)
+    shift_library:
+      num_bases: 8             # columns of B
+  head:
+    tau: 0.07
+    learnable_tau: false
+  inference:
+    unknown_threshold: null    # max-prob below this -> ignore_index
+    merge_lora: true
+
+loss:
+  masked_softmax: true         # absent classes are never negatives
+  ce: {weight: 1.0, class_weights: null, label_smoothing: 0.0}   # class_weights: null | list | path to eda json
+  dice: {enabled: true, weight: 0.5}
+  hidden:
+    enabled: true              # simulated absence
+    weight: 0.5
+    num_hidden: 2              # classes hidden per iteration
+    prob: 0.5                  # probability an iteration hides classes
+    detach_features: true      # hidden loss only trains the prototype/shift path
+    require_memory: true       # only hide classes whose memory was written by an earlier task
+
+train:
+  epochs: 10                   # per task; int or list (one per task)
+  batch_size: 4
+  num_workers: 4
+  accum_steps: 1
+  max_iters_per_epoch: null
+  grad_clip: 1.0
+  reset_optimizer_per_task: true
+  optimizer:
+    name: adamw                # adamw | adam | sgd
+    lr: 6.0e-4
+    weight_decay: 0.01
+    momentum: 0.9
+    lr_mult: {lora: 1.0, decoder: 1.0, shift_estimator: 1.0, prototypes: 1.0, head: 1.0, encoder: 0.1}
+  scheduler:
+    name: poly                 # poly | cosine | step | none
+    power: 0.9
+    warmup_iters: 100
+    step_size: 10
+    gamma: 0.1
+  log_interval: 20
+
+eval:
+  batch_size: 2
+  num_workers: 2
+  every: 1                     # validate every N epochs
+  val_on: current              # current | seen   (seen = average over all tasks so far)
+  track_seen_every_epoch: true # evaluate every seen task each epoch -> fine-grained forgetting curve
+  test_after_each_task: true
+  boundary_dilation: 0.02      # BIoU band: fraction of image diagonal (>=1 px) or int px
+  print_class_table: true
+
+viz:
+  num_samples: 8               # N image / GT / prediction rows
+  dpi: 120
+  tsne:
+    enabled: true
+    max_images: 40
+    pixels_per_image: 200
+    max_points: 6000
+    perplexity: 30
+
+eda:
+  max_images: null             # cap images per split for label statistics
+  image_stats_max: 300         # images used for RGB / brightness statistics
+  spatial_res: [64, 128]       # class location heatmap resolution
+  num_sample_grid: 8

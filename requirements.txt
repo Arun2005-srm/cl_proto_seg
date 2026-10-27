@@ -1,0 +1,10 @@
+torch>=2.1
+torchvision
+transformers>=4.40
+huggingface_hub
+numpy
+pillow
+pyyaml
+matplotlib
+scikit-learn
+tqdm

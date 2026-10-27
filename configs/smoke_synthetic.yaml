@@ -1,0 +1,59 @@
+# Smoke test: the Cityscapes config on tiny synthetic data with a small CNN encoder.
+#   python tools/make_synthetic_cityscapes.py --out data/synthetic_cityscapes
+#   python tools/train.py --config configs/smoke_synthetic.yaml
+_base_: cityscapes.yaml
+
+experiment:
+  name: smoke_synthetic
+
+dataset:
+  root: data/synthetic_cityscapes
+
+splits:
+  val:  {from: train, fraction: 0.25, per_domain: true}
+  test: {split: val, domains: all}
+
+continual:
+  tasks:
+    - [aachen, bochum]
+    - [bremen, cologne]
+    - [darmstadt, dusseldorf]
+
+transforms:
+  train:
+    - {name: RandomScale, scale: [0.75, 1.25]}
+    - {name: RandomCrop, size: [128, 128]}
+    - {name: HorizontalFlip, p: 0.5}
+    - {name: ColorJitter, brightness: 0.2, contrast: 0.2, saturation: 0.2, p: 0.5}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+  val:
+    - {name: Resize, size: [128, 256]}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+  test:
+    - {name: Resize, size: [128, 256]}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+
+model:
+  encoder: {name: simple_cnn, freeze: false, pretrained: null}
+  prototypes:
+    anchors: {source: random}
+
+train:
+  epochs: 3
+  batch_size: 4
+  accum_steps: 1
+  num_workers: 0
+  log_interval: 0
+  optimizer: {lr: 1.0e-3}
+  scheduler: {warmup_iters: 5}
+
+eval:
+  batch_size: 4
+  num_workers: 0
+
+viz:
+  num_samples: 4
+  tsne: {max_images: 8, pixels_per_image: 100, max_points: 1500}
+
+eda:
+  num_sample_grid: 4

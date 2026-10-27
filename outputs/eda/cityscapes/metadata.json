@@ -1,0 +1,405 @@
+{
+  "dataset": "cityscapes",
+  "root": "data/synthetic_cityscapes",
+  "num_classes": 19,
+  "classes": [
+    "road",
+    "sidewalk",
+    "building",
+    "wall",
+    "fence",
+    "pole",
+    "traffic light",
+    "traffic sign",
+    "vegetation",
+    "terrain",
+    "sky",
+    "person",
+    "rider",
+    "car",
+    "truck",
+    "bus",
+    "train",
+    "motorcycle",
+    "bicycle"
+  ],
+  "ignore_index": 255,
+  "splits": {
+    "train": {
+      "num_images": 54,
+      "num_domains": 6,
+      "domains": {
+        "aachen": 9,
+        "bochum": 9,
+        "bremen": 9,
+        "cologne": 9,
+        "darmstadt": 9,
+        "dusseldorf": 9
+      },
+      "label_resolutions": [
+        [
+          128,
+          256
+        ]
+      ],
+      "class_pixel_fraction": {
+        "road": 0.376576,
+        "sidewalk": 0.160919,
+        "building": 0.232374,
+        "wall": 0.0,
+        "fence": 0.0,
+        "pole": 0.004361,
+        "traffic light": 0.0,
+        "traffic sign": 0.000899,
+        "vegetation": 0.044626,
+        "terrain": 0.0,
+        "sky": 0.148167,
+        "person": 0.004534,
+        "rider": 0.0,
+        "car": 0.025863,
+        "truck": 0.0,
+        "bus": 0.0,
+        "train": 0.0,
+        "motorcycle": 0.0,
+        "bicycle": 0.001681
+      },
+      "class_image_presence": {
+        "road": 1.0,
+        "sidewalk": 1.0,
+        "building": 1.0,
+        "wall": 0.0,
+        "fence": 0.0,
+        "pole": 0.7407,
+        "traffic light": 0.0,
+        "traffic sign": 0.4259,
+        "vegetation": 1.0,
+        "terrain": 0.0,
+        "sky": 1.0,
+        "person": 0.463,
+        "rider": 0.0,
+        "car": 0.6852,
+        "truck": 0.0,
+        "bus": 0.0,
+        "train": 0.0,
+        "motorcycle": 0.0,
+        "bicycle": 0.3889
+      },
+      "classes_never_seen": [
+        "wall",
+        "fence",
+        "traffic light",
+        "terrain",
+        "rider",
+        "truck",
+        "bus",
+        "train",
+        "motorcycle"
+      ],
+      "mean_classes_per_image": 7.703703703703703,
+      "mean_ignore_fraction": 0.01010696976273148,
+      "imbalance_ratio_max_over_min": 419.06353240152475,
+      "rgb_mean": [
+        0.44440001249313354,
+        0.30390000343322754,
+        0.4514000117778778
+      ],
+      "rgb_std": [
+        0.23399999737739563,
+        0.15850000083446503,
+        0.22110000252723694
+      ],
+      "mean_brightness": 0.39992794891198474
+    },
+    "val": {
+      "num_images": 18,
+      "num_domains": 6,
+      "domains": {
+        "aachen": 3,
+        "bochum": 3,
+        "bremen": 3,
+        "cologne": 3,
+        "darmstadt": 3,
+        "dusseldorf": 3
+      },
+      "label_resolutions": [
+        [
+          128,
+          256
+        ]
+      ],
+      "class_pixel_fraction": {
+        "road": 0.383496,
+        "sidewalk": 0.16043,
+        "building": 0.228388,
+        "wall": 0.0,
+        "fence": 0.0,
+        "pole": 0.003475,
+        "traffic light": 0.0,
+        "traffic sign": 0.000834,
+        "vegetation": 0.047907,
+        "terrain": 0.0,
+        "sky": 0.147925,
+        "person": 0.005023,
+        "rider": 0.0,
+        "car": 0.021276,
+        "truck": 0.0,
+        "bus": 0.0,
+        "train": 0.0,
+        "motorcycle": 0.0,
+        "bicycle": 0.001247
+      },
+      "class_image_presence": {
+        "road": 1.0,
+        "sidewalk": 1.0,
+        "building": 1.0,
+        "wall": 0.0,
+        "fence": 0.0,
+        "pole": 0.6111,
+        "traffic light": 0.0,
+        "traffic sign": 0.3889,
+        "vegetation": 1.0,
+        "terrain": 0.0,
+        "sky": 1.0,
+        "person": 0.4444,
+        "rider": 0.0,
+        "car": 0.4444,
+        "truck": 0.0,
+        "bus": 0.0,
+        "train": 0.0,
+        "motorcycle": 0.0,
+        "bicycle": 0.3333
+      },
+      "classes_never_seen": [
+        "wall",
+        "fence",
+        "traffic light",
+        "terrain",
+        "rider",
+        "truck",
+        "bus",
+        "train",
+        "motorcycle"
+      ],
+      "mean_classes_per_image": 7.222222222222222,
+      "mean_ignore_fraction": 0.009969075520833334,
+      "imbalance_ratio_max_over_min": 459.83572895277206,
+      "rgb_mean": [
+        0.44699999690055847,
+        0.30630001425743103,
+        0.44920000433921814
+      ],
+      "rgb_std": [
+        0.23420000076293945,
+        0.15889999270439148,
+        0.2176000028848648
+      ],
+      "mean_brightness": 0.40086233284738326
+    },
+    "test": {
+      "num_images": 24,
+      "num_domains": 2,
+      "domains": {
+        "frankfurt": 12,
+        "lindau": 12
+      },
+      "label_resolutions": [
+        [
+          128,
+          256
+        ]
+      ],
+      "class_pixel_fraction": {
+        "road": 0.3882,
+        "sidewalk": 0.161488,
+        "building": 0.227111,
+        "wall": 0.0,
+        "fence": 0.0,
+        "pole": 0.003497,
+        "traffic light": 0.0,
+        "traffic sign": 0.00104,
+        "vegetation": 0.039147,
+        "terrain": 0.0,
+        "sky": 0.148342,
+        "person": 0.00775,
+        "rider": 0.0,
+        "car": 0.022183,
+        "truck": 0.0,
+        "bus": 0.0,
+        "train": 0.0,
+        "motorcycle": 0.0,
+        "bicycle": 0.001241
+      },
+      "class_image_presence": {
+        "road": 1.0,
+        "sidewalk": 1.0,
+        "building": 1.0,
+        "wall": 0.0,
+        "fence": 0.0,
+        "pole": 0.5,
+        "traffic light": 0.0,
+        "traffic sign": 0.4583,
+        "vegetation": 1.0,
+        "terrain": 0.0,
+        "sky": 1.0,
+        "person": 0.7917,
+        "rider": 0.0,
+        "car": 0.6667,
+        "truck": 0.0,
+        "bus": 0.0,
+        "train": 0.0,
+        "motorcycle": 0.0,
+        "bicycle": 0.2917
+      },
+      "classes_never_seen": [
+        "wall",
+        "fence",
+        "traffic light",
+        "terrain",
+        "rider",
+        "truck",
+        "bus",
+        "train",
+        "motorcycle"
+      ],
+      "mean_classes_per_image": 7.708333333333333,
+      "mean_ignore_fraction": 0.009962717692057291,
+      "imbalance_ratio_max_over_min": 373.1493827160494,
+      "rgb_mean": [
+        0.4456999897956848,
+        0.22529999911785126,
+        0.5453000068664551
+      ],
+      "rgb_std": [
+        0.23319999873638153,
+        0.1265999972820282,
+        0.24779999256134033
+      ],
+      "mean_brightness": 0.40542776013414067
+    }
+  },
+  "tasks": [
+    [
+      "aachen",
+      "bochum"
+    ],
+    [
+      "bremen",
+      "cologne"
+    ],
+    [
+      "darmstadt",
+      "dusseldorf"
+    ]
+  ],
+  "absent_classes_per_domain": {
+    "aachen": [
+      "wall",
+      "fence",
+      "traffic light",
+      "terrain",
+      "rider",
+      "truck",
+      "bus",
+      "train",
+      "motorcycle"
+    ],
+    "bochum": [
+      "wall",
+      "fence",
+      "traffic light",
+      "terrain",
+      "rider",
+      "truck",
+      "bus",
+      "train",
+      "motorcycle",
+      "bicycle"
+    ],
+    "bremen": [
+      "wall",
+      "fence",
+      "traffic light",
+      "terrain",
+      "person",
+      "rider",
+      "truck",
+      "bus",
+      "train",
+      "motorcycle"
+    ],
+    "cologne": [
+      "wall",
+      "fence",
+      "traffic light",
+      "traffic sign",
+      "terrain",
+      "rider",
+      "truck",
+      "bus",
+      "train",
+      "motorcycle",
+      "bicycle"
+    ],
+    "darmstadt": [
+      "wall",
+      "fence",
+      "traffic light",
+      "terrain",
+      "rider",
+      "truck",
+      "bus",
+      "train",
+      "motorcycle"
+    ],
+    "dusseldorf": [
+      "wall",
+      "fence",
+      "traffic light",
+      "terrain",
+      "person",
+      "rider",
+      "truck",
+      "bus",
+      "train",
+      "motorcycle"
+    ]
+  },
+  "task_class_sets": {
+    "T0": [
+      "road",
+      "sidewalk",
+      "building",
+      "pole",
+      "traffic sign",
+      "vegetation",
+      "sky",
+      "person",
+      "car",
+      "bicycle"
+    ],
+    "T1": [
+      "road",
+      "sidewalk",
+      "building",
+      "pole",
+      "traffic sign",
+      "vegetation",
+      "sky",
+      "person",
+      "car",
+      "bicycle"
+    ],
+    "T2": [
+      "road",
+      "sidewalk",
+      "building",
+      "pole",
+      "traffic sign",
+      "vegetation",
+      "sky",
+      "person",
+      "car",
+      "bicycle"
+    ]
+  }
+}

@@ -1,0 +1,77 @@
+# Cityscapes, domain-incremental over cities (DRIFT setting).
+# Expected layout (official download: leftImg8bit_trainvaltest.zip + gtFine_trainvaltest.zip):
+#   <root>/leftImg8bit/{train,val}/<city>/<city>_xxxxxx_xxxxxx_leftImg8bit.png
+#   <root>/gtFine/{train,val}/<city>/<city>_xxxxxx_xxxxxx_gtFine_labelIds.png
+# Test labels are not public, so the official val cities (frankfurt, lindau, munster)
+# serve as the held-out test set and val is carved from each training city.
+_base_: defaults.yaml
+
+experiment:
+  name: cityscapes_drift
+
+dataset:
+  name: cityscapes
+  root: D:/datasets/cityscapes          # <-- change me
+  classes: [road, sidewalk, building, wall, fence, pole, traffic light, traffic sign,
+            vegetation, terrain, sky, person, rider, car, truck, bus, train, motorcycle, bicycle]
+  palette: [[128,64,128],[244,35,232],[70,70,70],[102,102,156],[190,153,153],[153,153,153],
+            [250,170,30],[220,220,0],[107,142,35],[152,251,152],[70,130,180],[220,20,60],
+            [255,0,0],[0,0,142],[0,0,70],[0,60,100],[0,80,100],[0,0,230],[119,11,32]]
+  ignore_index: 255
+  source:
+    mode: glob
+    image_glob: "leftImg8bit/{split}/*/*_leftImg8bit.png"
+    label_from_image: [["leftImg8bit/", "gtFine/"], ["_leftImg8bit.png", "_gtFine_labelIds.png"]]
+    domain_regex: "leftImg8bit/[^/]+/([^/]+)/"
+  label_map: {7: 0, 8: 1, 11: 2, 12: 3, 13: 4, 17: 5, 19: 6, 20: 7, 21: 8, 22: 9,
+              23: 10, 24: 11, 25: 12, 26: 13, 27: 14, 28: 15, 31: 16, 32: 17, 33: 18}
+
+splits:
+  train: {split: train, domains: all}
+  val:   {from: train, fraction: 0.1, per_domain: true}
+  test:  {split: val, domains: [frankfurt, lindau, munster]}
+
+transforms:
+  train:
+    - {name: RandomScale, scale: [0.5, 2.0]}
+    - {name: RandomCrop, size: [512, 512]}
+    - {name: HorizontalFlip, p: 0.5}
+    - {name: ColorJitter, brightness: 0.25, contrast: 0.25, saturation: 0.25, hue: 0.0, p: 0.8}
+    - {name: GaussianBlur, kernel: 5, sigma: [0.1, 1.5], p: 0.2}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+  val:
+    - {name: Resize, size: [512, 1024]}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+  test:
+    - {name: Resize, size: [512, 1024]}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+
+# 18 training cities -> 6 tasks of 3 cities. Use one city per entry for the
+# per-city protocol, or `tasks: auto` + `group_size`.
+continual:
+  enabled: true
+  tasks:
+    - [aachen, bochum, bremen]
+    - [cologne, darmstadt, dusseldorf]
+    - [erfurt, hamburg, hanover]
+    - [jena, krefeld, monchengladbach]
+    - [strasbourg, stuttgart, tubingen]
+    - [ulm, weimar, zurich]
+  valid_set: task
+  task_overrides: {}
+    # 0: {train: {epochs: 20}}           # longer first task, for example
+
+model:
+  encoder: {name: segformer, pretrained: nvidia/mit-b2, freeze: true}
+  prototypes:
+    anchors: {source: clip}             # falls back to random if CLIP can't be loaded
+
+train:
+  epochs: 10
+  batch_size: 2                         # 4 GB GPU; raise on bigger cards
+  accum_steps: 4                        # effective batch 8
+  num_workers: 4
+  optimizer: {name: adamw, lr: 6.0e-4, weight_decay: 0.01}
+
+eval:
+  batch_size: 1
