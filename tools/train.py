@@ -31,6 +31,10 @@ def main():
     save_config(cfg, os.path.join(run_dir, "config.yaml"))
     print(f"[run] {run_dir}")
     seed_everything(cfg.experiment.seed, cfg.experiment.deterministic)
+    if cfg.experiment.get("tf32", True):   # A100/H100: TF32 matmuls/convs for the fp32 parts, ~2x faster
+        import torch
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     trainer = Trainer(cfg, run_dir)
     trainer.fit()

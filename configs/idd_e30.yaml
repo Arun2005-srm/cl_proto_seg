@@ -1,0 +1,21 @@
+# IDD, short epoch-based schedule: 30 epochs on task 1, 20 on each later task (~124k images
+# seen in total, vs ~432k for idd.yaml at batch 12). The encoder is fine-tuned at 0.1x lr,
+# which learns much faster per epoch than frozen + LoRA; batch 8 gives twice the updates per
+# epoch of batch 16. Validation every 10 epochs, TTA for the final test.
+#   python tools/preresize.py --config configs/idd.yaml --dst /raid/workspace/idd_720 --size 720 1280
+#   python tools/train.py --config configs/idd_e30.yaml --opts dataset.root=/raid/workspace/idd_720
+_base_: idd_fast_ft.yaml
+
+experiment:
+  name: idd_e30
+
+train:
+  iters_per_task: null            # use epochs, not a step budget
+  epochs: [30, 20, 20, 20, 20, 20]
+  batch_size: 8
+  log_interval: 0
+  scheduler: {name: poly, power: 1.0, warmup_iters: 300}
+
+eval:
+  every_iters: null
+  every: 10

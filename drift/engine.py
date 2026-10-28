@@ -24,6 +24,12 @@ from .models.drift import DRIFT
 from .utils import dump_json
 
 
+def amp_dtype(cfg):
+    """torch dtype for autocast: experiment.amp_dtype = fp16 (default) | bf16."""
+    return torch.bfloat16 if str(cfg.experiment.get("amp_dtype", "fp16")).lower() in ("bf16", "bfloat16") \
+        else torch.float16
+
+
 # ============================================================================ data
 class _Presence(Dataset):
     def __init__(self, ds):
@@ -79,9 +85,10 @@ def make_loader(cfg, samples, split: str, shuffle: bool, batch_size: int, num_wo
         # a task smaller than one batch: sample with replacement so every step sees a full batch
         # (batch size 1 breaks some fused kernels and makes statistics meaningless)
         sampler, shuffle = RandomSampler(ds, replacement=True, num_samples=batch_size), False
+    extra = {"prefetch_factor": int(cfg.train.get("prefetch_factor", 4))} if num_workers > 0 else {}
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, sampler=sampler, num_workers=num_workers,
                       pin_memory=torch.cuda.is_available(), drop_last=drop_last and len(ds) >= batch_size,
-                      collate_fn=_collate, persistent_workers=num_workers > 0)
+                      collate_fn=_collate, persistent_workers=num_workers > 0, **extra)
 
 
 # ============================================================================ optim
@@ -121,7 +128,7 @@ def build_scheduler(opt, scfg, total_iters: int, warmup: int):
 
 
 # ============================================================================ eval
-def _forward_logits(model, x, out_size, tta, amp, device):
+def _forward_logits(model, x, out_size, tta, amp, device, dtype=torch.float16):
     scales = list(tta.get("scales", [1.0])) if tta else [1.0]
     flip = bool(tta.get("flip", False)) if tta else False
     acc, out0 = None, None
@@ -129,7 +136,7 @@ def _forward_logits(model, x, out_size, tta, amp, device):
         xs = x if sc == 1.0 else F.interpolate(x, scale_factor=sc, mode="bilinear", align_corners=False)
         for fl in ([False, True] if flip else [False]):
             xi = xs.flip(-1) if fl else xs
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
+            with torch.autocast(device_type=device.type, dtype=dtype, enabled=amp):
                 out = model(xi)
             lg = out["logits"].float()
             lg = lg.flip(-1) if fl else lg
@@ -156,7 +163,7 @@ def evaluate(model, loader, cfg, device, with_loss: bool = True, max_batches=Non
         if max_batches and bi >= max_batches:
             break
         x, y = b["image"].to(device, non_blocking=True), b["label"].to(device, non_blocking=True)
-        prob, out = _forward_logits(model, x, y.shape[-2:], tta, amp, device)
+        prob, out = _forward_logits(model, x, y.shape[-2:], tta, amp, device, amp_dtype(cfg))
         if with_loss:
             l = F.nll_loss(prob.clamp(min=1e-8).log(), y, ignore_index=ign)
             if torch.isfinite(l):
@@ -211,6 +218,7 @@ class Trainer:
         dev = cfg.experiment.device
         self.device = torch.device(dev if (dev == "cpu" or torch.cuda.is_available()) else "cpu")
         self.amp = bool(cfg.experiment.amp) and self.device.type == "cuda"
+        self.amp_dtype = amp_dtype(cfg)
         self.classes = list(cfg.dataset.classes)
         self.C = len(self.classes)
 
@@ -317,7 +325,7 @@ class Trainer:
             th = self.task_hidden
             if th is not None and np.random.rand() >= float(cfg.loss.hidden.get("iter_prob", 1.0)):
                 th = torch.zeros_like(th)
-            with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.amp):
+            with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp):
                 out = self.model(x)
             loss, parts, (c_ok, c_n), hidden = self.criterion(self.model, out, y, allowed, mem_mask, th,
                                                               self.hide_candidates)
@@ -359,7 +367,7 @@ class Trainer:
         zs, ys, ss = [], [], []
         for b in loader:
             x, y = b["image"].to(self.device), b["label"].to(self.device)
-            with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.amp):
+            with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp):
                 out = model(x)
             z = F.normalize(out["z"].float(), dim=1)
             yl = F.interpolate(y[:, None].float(), size=z.shape[-2:], mode="nearest")[:, 0].long()
@@ -430,7 +438,7 @@ class Trainer:
             s_sum, s_n = None, 0
             for b in loader:
                 x, y = b["image"].to(self.device), b["label"].to(self.device)
-                with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.amp):
+                with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp):
                     out = self.model(x)
                 z = F.normalize(out["z"].float(), dim=1)
                 if out.get("s") is not None:
@@ -507,7 +515,7 @@ class Trainer:
                         cfg.train.optimizer.get("lr_mult", {}).get(gr["name"].replace("_no_wd", ""), 1.0))
             warm = cfg.train.scheduler.get("warmup_iters", 0) if (t == 0 or cfg.train.scheduler.get("warmup_every_task")) else 0
             sched = build_scheduler(opt, cfg.train.scheduler, max(1, iters // cfg.train.accum_steps), warm)
-            scaler = torch.amp.GradScaler("cuda", enabled=self.amp)
+            scaler = torch.amp.GradScaler("cuda", enabled=self.amp and self.amp_dtype == torch.float16)
             self.model.mark_seen(self.task_valid[t])
             self.task_hidden = None
             # classes that may be hidden: valid here and not dominant (present in <= max_presence of the
@@ -519,6 +527,9 @@ class Trainer:
             old_model = copy.deepcopy(self.model).eval() if (t > 0 and self.model.uses_memory) else None
             hid = (", hidden for the task: " + ", ".join(self.classes[c] for c in torch.nonzero(self.task_hidden).flatten())
                    ) if self.task_hidden is not None and self.task_hidden.any() else ""
+            every = int(cfg.eval.every)
+            if cfg.eval.get("every_iters"):
+                every = max(1, round(int(cfg.eval.every_iters) / max(1, ipe)))
             print(f"\n=== Task {t + 1}/{T}  [{', '.join(self.tasks[t][:6])}{'...' if len(self.tasks[t]) > 6 else ''}]"
                   f"  train {len(tr)} imgs, {epochs} epochs x {ipe} it, lr {cfg.train.optimizer.lr * lr_scale:.2e}{hid} ===")
 
@@ -529,7 +540,7 @@ class Trainer:
                 row = {"task": t, "epoch": ep + 1, "global_epoch": self.global_epoch,
                        "lr": opt.param_groups[0]["lr"], **{f"train_{k}": v for k, v in trs.items()}}
                 val_loader = self._val_loader(cfg, t)
-                do_eval = val_loader is not None and ((ep + 1) % cfg.eval.every == 0 or ep + 1 == epochs)
+                do_eval = val_loader is not None and ((ep + 1) % every == 0 or ep + 1 == epochs)
                 if do_eval:
                     vr = evaluate(self.model, val_loader, cfg, self.device)
                     row.update(val_loss=vr["loss"], val_acc=vr["pixel_acc"], mIoU=vr["mIoU"], IoU=vr["fwIoU"],

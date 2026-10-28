@@ -1,0 +1,18 @@
+# IDD, fast schedule with the MiT-B2 encoder fine-tuned at 0.1x lr (no LoRA) and multi-scale +
+# flip test-time augmentation for the final test. Unfreezing the encoder is the largest single
+# score lever; it costs roughly 1.5x the time per step of idd_fast.yaml.
+#   python tools/train.py --config configs/idd_fast_ft.yaml --opts dataset.root=/raid/workspace/idd_720
+_base_: idd_fast.yaml
+
+experiment:
+  name: idd_fast_ft
+
+model:
+  modules: {lora: false}
+  encoder: {freeze: false}
+  inference:
+    tta: {scales: [0.75, 1.0, 1.25], flip: true}
+
+train:
+  optimizer:
+    lr_mult: {encoder: 0.1}

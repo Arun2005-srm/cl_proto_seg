@@ -1,0 +1,30 @@
+# IDD, fast schedule (frozen MiT-B2 + LoRA). Same method and tasks as idd.yaml, about 3x fewer
+# steps and a faster input pipeline:
+#   - 6000 steps on the first task (it learns the label space), 1500 on each later task
+#     (adaptation only, at 0.3x lr). The old 16000 / 4000 budget gave ~200 epochs on task 1;
+#     val mIoU had mostly saturated after ~3500 steps.
+#   - batch 16, bf16 autocast, TF32, 16 loader workers with prefetch
+#   - validation every ~1500 steps instead of every 5 epochs
+#
+# Fastest: resize IDD to 720p once and train from that copy (no 1080p decode + resize per step):
+#   python tools/preresize.py --config configs/idd.yaml --dst /raid/workspace/idd_720 --size 720 1280
+#   python tools/train.py --config configs/idd_fast.yaml --opts dataset.root=/raid/workspace/idd_720
+_base_: idd.yaml
+
+experiment:
+  name: idd_fast
+  amp_dtype: bf16
+  tf32: true
+
+train:
+  iters_per_task: [6000, 1500, 1500, 1500, 1500, 1500]
+  batch_size: 16
+  num_workers: 16
+  prefetch_factor: 4
+  log_interval: 500
+  scheduler: {name: poly, power: 1.0, warmup_iters: 500}
+
+eval:
+  batch_size: 8
+  num_workers: 8
+  every_iters: 1500

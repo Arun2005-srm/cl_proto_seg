@@ -43,6 +43,19 @@ python tools/train.py --config configs/idd.yaml
 python tools/test.py  --config configs/idd.yaml --ckpt outputs/idd_drift/<run>/task5.pt
 ```
 
+### Fast IDD training (recommended)
+
+`configs/idd_fast.yaml` (LoRA) and `configs/idd_fast_ft.yaml` (encoder fine-tuned + TTA, the
+highest-scoring setting) train each task for a fixed number of steps instead of epochs:
+6000 steps on task 1, 1500 on each later task, at batch 16. They use bf16 and TF32, 16 loader
+workers, and validation every ~1500 steps. Resize the dataset to 720p once, so the loaders
+don't decode 1080p PNGs on every step:
+
+```bash
+python tools/preresize.py --config configs/idd.yaml --dst /raid/workspace/idd_720 --size 720 1280
+python tools/train.py --config configs/idd_fast_ft.yaml --opts dataset.root=/raid/workspace/idd_720
+```
+
 Set `dataset.root` in the config first. To check everything on fake data in about a minute:
 
 ```bash

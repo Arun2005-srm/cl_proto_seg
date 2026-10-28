@@ -10,6 +10,8 @@ experiment:
   seed: 42
   device: cuda                 # cuda | cpu
   amp: true                    # mixed precision on cuda
+  amp_dtype: fp16              # fp16 | bf16 (bf16 on A100/H100: no loss scaling, more stable)
+  tf32: true                   # allow TF32 matmuls/convs on Ampere+ GPUs
   deterministic: false
   triton_native_ops: auto      # auto: disable torch's Triton-backed eager ops when Python.h is missing | on | off
 
@@ -148,6 +150,7 @@ train:
   num_workers: 4
   accum_steps: 1
   max_iters_per_epoch: null
+  prefetch_factor: 4           # batches each loader worker prepares ahead
   grad_clip: 1.0
   iters_per_task: null         # if set (int or per-task list), epochs are derived so each task gets this many steps
   reset_optimizer_per_task: true
@@ -174,6 +177,7 @@ eval:
   batch_size: 2
   num_workers: 2
   every: 1                     # validate every N epochs
+  every_iters: null            # if set, validate about every N training steps instead (overrides `every`)
   val_on: current              # current | seen   (seen = average over all tasks so far)
   track_seen_every_epoch: true # evaluate every seen task each epoch -> fine-grained forgetting curve
   seen_max_tasks: 8            # ... but at most the last N seen tasks per epoch
