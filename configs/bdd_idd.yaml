@@ -1,0 +1,53 @@
+# Cross-dataset domain-incremental segmentation: BDD100K -> IDD.
+# Same protocol as cs_idd.yaml (19 Cityscapes classes, one task per dataset, 30 epochs per
+# task, each dataset's official val as its test set), with BDD100K as the first task.
+#   - BDD100K 10k segmentation labels already use the 19 Cityscapes train ids (no mapping)
+#   - IDD level-3 classes are mapped to them; IDD has no `train` class, so it is absent in task 2
+#
+# Layout on the DGX:
+#   bekerly/10k/{train,val}/<id>.jpg               images
+#   bekerly/labels/{train,val}/<id>_train_id.png   19-class train ids, 255 = ignore
+#   IDD/leftImg8bit/{train,val}/<seq>/<id>_leftImg8bit.png,  IDD/masks/{train,val}/<seq>/<id>.png
+#
+#   python tools/preresize.py --config configs/bdd_idd.yaml --dst /raid/workspace/bdd_idd_720 --short-side 720
+#   python tools/train.py --config configs/bdd_idd_ft.yaml --opts \
+#     dataset.domains.bdd100k.root=/raid/workspace/bdd_idd_720/bdd100k \
+#     dataset.domains.idd.root=/raid/workspace/bdd_idd_720/idd
+_base_: cs_idd.yaml
+
+experiment:
+  name: bdd_idd_drift
+
+dataset:
+  name: bdd_idd
+  domains:
+    _replace_: true
+    bdd100k:
+      root: /raid/workspace/city_datasets/cl_datasets/bekerly
+      source:
+        mode: glob
+        image_glob: "10k/{split}/*.jpg"
+        label_from_image: [["10k/", "labels/"], [".jpg", "_train_id.png"]]
+        domain_regex: null                       # no sub-folders; the whole dataset is one domain
+      label_map: null                            # already 19-class train ids
+      splits:
+        train: {split: train, domains: all}
+        val:   {from: train, fraction: 0.1, per_domain: false}
+        test:  {split: val, domains: all}
+    idd:
+      root: /raid/workspace/city_datasets/cl_datasets/IDD
+      source:
+        mode: glob
+        image_glob: "leftImg8bit/{split}/*/*_leftImg8bit.png"
+        label_from_image: [["leftImg8bit/", "masks/"], ["_leftImg8bit.png", ".png"]]
+        domain_regex: "leftImg8bit/[^/]+/([^/]+)/"
+      # IDD level-3 id -> Cityscapes train id; unlisted ids -> ignore (see cs_idd.yaml)
+      label_map: {0: 0, 2: 1, 13: 1, 3: 9, 4: 11, 5: 12, 6: 17, 7: 18, 9: 13, 10: 14, 11: 15,
+                  14: 3, 15: 4, 18: 7, 19: 6, 20: 5, 22: 2, 24: 8, 25: 10}
+      splits:
+        train: {split: train, domains: all}
+        val:   {from: train, fraction: 0.1, per_domain: true}
+        test:  {split: val, domains: all}
+
+continual:
+  tasks: [[bdd100k], [idd]]

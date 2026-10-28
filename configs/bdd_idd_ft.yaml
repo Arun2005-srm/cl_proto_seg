@@ -1,0 +1,16 @@
+# BDD100K -> IDD with the MiT-B2 encoder fine-tuned at 0.1x lr and test-time augmentation
+# (the higher-scoring variant). Same protocol as bdd_idd.yaml.
+_base_: bdd_idd.yaml
+
+experiment:
+  name: bdd_idd_drift_ft
+
+model:
+  modules: {lora: false}
+  encoder: {freeze: false}
+  inference:
+    tta: {scales: [0.75, 1.0, 1.25], flip: true}
+
+train:
+  optimizer:
+    lr_mult: {encoder: 0.1}

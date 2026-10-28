@@ -62,6 +62,9 @@ python tools/train.py --config configs/cs_idd.yaml --opts \
 
 (`preresize.py` reads the original locations from `dataset.domains.*.root` in the config.)
 
+Without Cityscapes, use `configs/bdd_idd.yaml` / `bdd_idd_ft.yaml`. It is the same protocol with
+**BDD100K → IDD**: BDD's 10k segmentation labels already use the 19 Cityscapes train ids.
+
 ### Fast IDD training (IDD-only protocol)
 
 `configs/idd_fast.yaml` (LoRA) and `configs/idd_fast_ft.yaml` (encoder fine-tuned + TTA, the
