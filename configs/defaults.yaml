@@ -11,6 +11,7 @@ experiment:
   device: cuda                 # cuda | cpu
   amp: true                    # mixed precision on cuda
   deterministic: false
+  triton_native_ops: auto      # auto: disable torch's Triton-backed eager ops when Python.h is missing | on | off
 
 dataset:
   name: null
@@ -57,9 +58,12 @@ continual:
   enabled: true
   tasks: auto                  # auto | [[city_a], [city_b, city_c], ...]
   group_size: 1                # auto: domains per task
-  order: sorted                # auto: sorted | random | as_found
+  order: sorted                # auto: sorted (natural: 2 < 10) | random | as_found
+  num_groups: null             # auto: make this many tasks with balanced image counts (overrides group_size)
+  min_images_per_task: 0       # merge tasks smaller than this into the next one
   num_tasks: null              # keep only the first N tasks
-  valid_set: task              # classes allowed in the softmax while training: task | batch | all
+  valid_set: task              # classes in the valid set while training: task | batch | all
+  absent_classes: {}           # controlled absence: {task_index: [class names]} removed from that task's labels
   task_overrides: {}           # {task_index: {train: {lr: ..., epochs: ...}, loss: {...}}}
 
 model:
@@ -80,25 +84,37 @@ model:
     pretrained: nvidia/mit-b2  # HF id or local path
     freeze: true
   lora:
-    rank: 8
-    alpha: 16
+    rank: 16
+    alpha: 32
     dropout: 0.0
-    targets: [query, key, value]
+    # regexes on the Linear's qualified name; a bare word matches the last name component.
+    # Covers SegFormer attention + MLP under both old (query/key/value) and new (q_proj/...) names.
+    targets: [query, key, value, q_proj, k_proj, v_proj, 'attention\.output\.dense$', out_proj,
+              dense1, dense2, fc1, fc2]
   decoder:
     dropout: 0.1
+    norm: gn                   # gn | ln | bn | none   (gn: no per-task drift of running stats, any batch size)
   shift_estimator:
     hidden: 256
     use_std: true
-    detach_input: false
+    detach_input: true         # g_phi reads detached encoder stats: no gradient from s into the encoder/LoRA
   prototypes:
+    term_gains: true           # learnable per-term gains g_a, g_m, g_s, g_b
     anchors:
-      source: random           # random | file | clip
-      file: null               # .pt tensor [C, D] (see tools/make_anchors.py)
+      source: clip             # clip | file | random
+      allow_fallback: false    # true: fall back to random anchors (with a warning) if clip/file fails
+      file: null               # .pt tensor [C, D]
       clip_model: openai/clip-vit-base-patch32
       template: "a photo of a {} in a city street"
     memory:
-      num_slots: 1             # K slots per class; written round-robin per task
-      momentum: 0.0            # EMA momentum when a slot is overwritten (0 = take the new mean)
+      num_slots: 4             # K slots per class, each keyed by the mean s of the domains that wrote it
+      momentum: 0.0            # floor on a new write's weight when merging into a full slot (0 = count-weighted mean)
+      read_tau: 0.1            # temperature of the s-keyed slot attention at read time
+      write_per: domain        # domain: one write per city (own key) | task: one write per task
+      drift_compensation:      # move stored slots with the feature space (SDC), using only current-task images
+        enabled: true
+        sigma: 0.3
+        pixels_per_image: 512
     shift_library:
       num_bases: 8             # columns of B
   head:
@@ -107,18 +123,24 @@ model:
   inference:
     unknown_threshold: null    # max-prob below this -> ignore_index
     merge_lora: true
+    tta: null                  # e.g. {scales: [0.75, 1.0, 1.25], flip: true}
 
 loss:
-  masked_softmax: true         # absent classes are never negatives
-  ce: {weight: 1.0, class_weights: null, label_smoothing: 0.0}   # class_weights: null | list | path to eda json
+  absent_negatives: detached   # masked (never negatives) | detached (negatives via frozen prototypes) | full
+  ce: {weight: 1.0, class_weights: null, label_smoothing: 0.0, ohem: null}   # ohem: {thresh: 0.7, min_kept: 100000}
   dice: {enabled: true, weight: 0.5}
   hidden:
     enabled: true              # simulated absence
+    scope: task                # task: one hidden set for the whole task (true absence) | iteration
     weight: 0.5
-    num_hidden: 2              # classes hidden per iteration
-    prob: 0.5                  # probability an iteration hides classes
+    num_hidden: 2              # classes hidden
+    prob: 1.0                  # probability a task (or iteration) hides classes
+    iter_prob: 0.5             # scope=task: fraction of iterations in which the task's hidden set is hidden
+    max_presence: 0.6          # only hide classes present in at most this fraction of the task's images
     detach_features: true      # hidden loss only trains the prototype/shift path
     require_memory: true       # only hide classes whose memory was written by an earlier task
+    write_hidden: true         # still write hidden classes to memory at the end of the task
+  shift_var: {weight: 0.05, target_std: 1.0}   # anti-collapse hinge on the per-dim std of s across the batch
 
 train:
   epochs: 10                   # per task; int or list (one per task)
@@ -127,17 +149,23 @@ train:
   accum_steps: 1
   max_iters_per_epoch: null
   grad_clip: 1.0
+  iters_per_task: null         # if set (int or per-task list), epochs are derived so each task gets this many steps
   reset_optimizer_per_task: true
   optimizer:
     name: adamw                # adamw | adam | sgd
     lr: 6.0e-4
-    weight_decay: 0.01
+    weight_decay: 0.01         # not applied to norms, biases, gains or the prototype path
     momentum: 0.9
     lr_mult: {lora: 1.0, decoder: 1.0, shift_estimator: 1.0, prototypes: 1.0, head: 1.0, encoder: 0.1}
+    later_task_lr_mult: 0.3    # tasks after the first train at this fraction of lr (limits drift)
+    lr_task_decay: 1.0         # further multiplicative decay per later task
+    min_task_lr_mult: 0.0
   scheduler:
     name: poly                 # poly | cosine | step | none
     power: 0.9
-    warmup_iters: 100
+    warmup_iters: 300          # first task only (capped at 10% of its steps)
+    warmup_every_task: false
+    min_lr_ratio: 0.0
     step_size: 10
     gamma: 0.1
   log_interval: 20
@@ -148,6 +176,8 @@ eval:
   every: 1                     # validate every N epochs
   val_on: current              # current | seen   (seen = average over all tasks so far)
   track_seen_every_epoch: true # evaluate every seen task each epoch -> fine-grained forgetting curve
+  seen_max_tasks: 8            # ... but at most the last N seen tasks per epoch
+  bootstrap: 1000              # image-level bootstrap resamples for the test mIoU confidence interval
   test_after_each_task: true
   boundary_dilation: 0.02      # BIoU band: fraction of image diagonal (>=1 px) or int px
   print_class_table: true

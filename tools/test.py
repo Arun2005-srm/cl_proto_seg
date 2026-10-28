@@ -15,6 +15,7 @@ from drift.config import load_config  # noqa: E402
 from drift.data.datasets import build_splits  # noqa: E402
 from drift.engine import load_model  # noqa: E402
 from drift.testing import run_test  # noqa: E402
+from drift.envcheck import check_environment  # noqa: E402
 from drift.utils import Tee, seed_everything  # noqa: E402
 
 
@@ -28,6 +29,7 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config, args.opts)
+    check_environment(cfg)
     seed_everything(cfg.experiment.seed)
     out = args.out or os.path.join(os.path.dirname(os.path.abspath(args.ckpt)), f"eval_{args.split}")
     os.makedirs(out, exist_ok=True)

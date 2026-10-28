@@ -1,0 +1,18 @@
+# Strongest IDD setting: the MiT-B2 encoder is fine-tuned at 0.1x lr (so LoRA is not needed),
+# with multi-scale + flip test-time augmentation. Everything else as in idd.yaml.
+# Compare against idd.yaml to see what the frozen-encoder constraint costs.
+_base_: idd.yaml
+
+experiment:
+  name: idd_drift_full_ft
+
+model:
+  modules: {lora: false}
+  encoder: {freeze: false}
+  inference:
+    tta: {scales: [0.75, 1.0, 1.25], flip: true}
+
+train:
+  optimizer:
+    lr: 6.0e-4
+    lr_mult: {encoder: 0.1}

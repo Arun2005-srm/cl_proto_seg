@@ -141,16 +141,42 @@ def plot_forgetting(R, tasks, seen_curve, test_curve, history, out_dir, dpi=120)
         fig.savefig(os.path.join(out_dir, "accuracy_matrix.png"), dpi=dpi, bbox_inches="tight"); plt.close(fig)
         files.append("accuracy_matrix.png")
 
-    if test_curve:
+    tc = [r for r in test_curve if r.get("split", "test") == "test"]
+    if tc:
         fig, ax = plt.subplots(figsize=(6, 3.2))
-        xs = [r["task"] for r in test_curve]
+        xs = [r["task"] for r in tc]
         for k, key in enumerate(("mIoU", "IoU", "BIoU", "Dice")):
-            _line(ax, xs, [100 * r[key] for r in test_curve], SERIES[k], key)
+            _line(ax, xs, [100 * r[key] for r in tc], SERIES[k], key)
+        for r_split in sorted({r["split"] for r in test_curve if r.get("split", "test") != "test"}):
+            rr = [r for r in test_curve if r.get("split") == r_split]
+            ax.plot([r["task"] for r in rr], [100 * r["mIoU"] for r in rr], color=SERIES[4], linestyle="--",
+                    label=f"{r_split} mIoU")
         ax.set_xticks(xs, [f"after T{i}" for i in xs]); ax.set_ylabel("%")
-        ax.set_title("Held-out test metrics after each task"); ax.legend(loc="best", ncol=2)
+        ax.set_title("Held-out metrics after each task"); ax.legend(loc="best", ncol=2)
         fig.savefig(os.path.join(out_dir, "test_metrics_per_task.png"), dpi=dpi, bbox_inches="tight"); plt.close(fig)
         files.append("test_metrics_per_task.png")
     return files
+
+
+def plot_class_forgetting(Rc, classes, out_dir, dpi=120):
+    """Per-class IoU on the pooled val of all seen tasks after each stage (fixed class set)."""
+    plt = setup_matplotlib()
+    done = int((~np.all(np.isnan(Rc), axis=1)).sum())
+    if done < 1:
+        return []
+    M = 100 * Rc[:done]
+    fig, ax = plt.subplots(figsize=(max(7, 0.42 * len(classes)), max(2.4, 0.4 * done + 1.4)))
+    im = ax.imshow(M, cmap="Blues", vmin=0, vmax=100, aspect="auto")
+    ax.set_xticks(np.arange(len(classes)), classes, rotation=60, ha="right")
+    ax.set_yticks(np.arange(done), [f"after T{i}" for i in range(done)]); ax.grid(False)
+    if done > 1:
+        f = np.nanmax(M[:-1], axis=0) - M[-1]
+        ax.set_title(f"Class IoU on pooled seen-task val (avg class forgetting {np.nanmean(f):.2f} pts)")
+    else:
+        ax.set_title("Class IoU on pooled seen-task val")
+    fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01, label="IoU %")
+    fig.savefig(os.path.join(out_dir, "class_forgetting.png"), dpi=dpi, bbox_inches="tight"); plt.close(fig)
+    return ["class_forgetting.png"]
 
 
 def plot_test_results(res, classes, palette, out_dir, dpi=120, prefix="test"):

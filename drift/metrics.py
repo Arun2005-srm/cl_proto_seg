@@ -23,8 +23,9 @@ def _boundary(mask: torch.Tensor, d: int) -> torch.Tensor:
 
 class SegMetrics:
     def __init__(self, num_classes: int, ignore_index: int = 255, boundary_dilation: float = 0.02,
-                 device="cpu", compute_boundary: bool = True):
+                 device="cpu", compute_boundary: bool = True, keep_per_image: bool = False):
         self.C, self.ign = num_classes, ignore_index
+        self.keep_per_image = keep_per_image
         self.dil = boundary_dilation
         self.device = device
         self.compute_boundary = compute_boundary
@@ -35,6 +36,7 @@ class SegMetrics:
         self.b_inter = torch.zeros(self.C, dtype=torch.float64, device=self.device)
         self.b_union = torch.zeros(self.C, dtype=torch.float64, device=self.device)
         self.unknown_fn = torch.zeros(self.C, dtype=torch.float64, device=self.device)
+        self.per_image: list[np.ndarray] = []      # [C, C+1] per image (last column: "unknown" misses)
 
     def _d(self, h, w) -> int:
         if isinstance(self.dil, int) or self.dil >= 1:
@@ -52,6 +54,15 @@ class SegMetrics:
         self.conf += torch.bincount(idx, minlength=self.C ** 2).reshape(self.C, self.C).double()
         if (~known).any():
             self.unknown_fn += torch.bincount(t[~known], minlength=self.C).double()
+        if self.keep_per_image:
+            C = self.C
+            for b in range(target.shape[0]):
+                tb, pb_ = target[b][valid[b]], pred[b][valid[b]]
+                kb = (pb_ >= 0) & (pb_ < C)
+                m = torch.zeros(C, C + 1, dtype=torch.int64, device=self.device)
+                m[:, :C] = torch.bincount(tb[kb] * C + pb_[kb], minlength=C * C).reshape(C, C)
+                m[:, C] = torch.bincount(tb[~kb], minlength=C)
+                self.per_image.append(m.cpu().numpy())
         if self.compute_boundary:
             d = self._d(*target.shape[-2:])
             for c in torch.unique(torch.cat([t, p[known]])).tolist():
@@ -91,6 +102,7 @@ class SegMetrics:
             "recall_per_class": np.where(present, rec, np.nan).tolist(),
             "support": gt.astype(np.int64).tolist(),
             "confusion": conf,
+            "unknown_fn": fn_extra.tolist(),
         }
 
 
@@ -109,7 +121,49 @@ def format_class_table(res: dict, classes, cols=("IoU", "F1", "BIoU")) -> str:
     return "\n".join(lines)
 
 
+def miou_from_conf(conf: np.ndarray, unknown_fn=None, classes: np.ndarray | None = None) -> float:
+    """mIoU from a [C, C] confusion matrix, over classes present in GT (optionally a fixed subset)."""
+    conf = np.asarray(conf, float)
+    tp = np.diag(conf)
+    gt = conf.sum(1) + (0 if unknown_fn is None else np.asarray(unknown_fn, float))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        iou = tp / (gt + conf.sum(0) - tp)
+    sel = gt > 0
+    if classes is not None:
+        sel &= np.asarray(classes, bool)
+    return float(np.nanmean(iou[sel])) if sel.any() else float("nan")
+
+
+def bootstrap_miou(per_image: list[np.ndarray], n: int = 1000, seed: int = 0, alpha: float = 0.05) -> dict:
+    """Image-level bootstrap of mIoU: resample test images with replacement."""
+    if not per_image:
+        return {}
+    P = np.stack(per_image)                               # [N, C, C+1]
+    rng = np.random.default_rng(seed)
+    C = P.shape[1]
+    vals = []
+    for _ in range(n):
+        m = P[rng.integers(0, len(P), len(P))].sum(0)
+        vals.append(miou_from_conf(m[:, :C], m[:, C]))
+    vals = np.array(vals)
+    return {"mean": float(vals.mean()), "std": float(vals.std()), "lo": float(np.quantile(vals, alpha / 2)),
+            "hi": float(np.quantile(vals, 1 - alpha / 2)), "n_boot": n, "n_images": len(P)}
+
+
 # ----------------------------------------------------------------------- continual
+def class_forgetting(Rc: np.ndarray) -> dict:
+    """Rc[i, c] = IoU of class c on the pooled val of all tasks seen so far, after task i.
+    Forgetting per class uses one fixed class set, so it is not confounded by which
+    classes each task happens to contain (unlike per-task mIoU)."""
+    T = Rc.shape[0]
+    if T < 2:
+        return {"avg_class_forgetting": 0.0, "class_forgetting": [0.0] * Rc.shape[1]}
+    best = np.nanmax(Rc[:-1], axis=0)
+    f = best - Rc[-1]
+    return {"avg_class_forgetting": float(np.nanmean(f)) if np.isfinite(f).any() else 0.0,
+            "class_forgetting": [None if np.isnan(x) else float(x) for x in f]}
+
+
 def continual_metrics(R: np.ndarray) -> dict:
     """R[i, j] = metric on task j after training task i (NaN if not evaluated)."""
     T = R.shape[0]

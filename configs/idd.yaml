@@ -1,0 +1,90 @@
+# IDD (India Driving Dataset, segmentation part I), 26 level-3 classes, domain-incremental.
+# Expected layout (as exported on the DGX):
+#   <root>/leftImg8bit/{train,val}/<seq>/<id>_leftImg8bit.png
+#   <root>/masks/{train,val}/<seq>/<id>.png        level-3 ids 0..25, 255 = ignore
+# IDD "domains" are capture sequences (numbered folders), not cities. 120 training
+# sequences hold 1-200 images each, so one task per sequence (the old setup) gives
+# tasks of a single image. Here they are grouped into 6 tasks with balanced image counts.
+_base_: defaults.yaml
+
+experiment:
+  name: idd_drift
+
+dataset:
+  name: idd
+  root: /raid/workspace/datasets/idd_seg          # <-- change me
+  classes: [road, drivable fallback, sidewalk, non-drivable fallback, person, rider, motorcycle, bicycle,
+            autorickshaw, car, truck, bus, vehicle fallback, curb, wall, fence, guard rail, billboard,
+            traffic sign, traffic light, pole, obs-str-bar-fallback, building, bridge, vegetation, sky]
+  palette: [[128,64,128],[81,0,81],[244,35,232],[152,251,152],[220,20,60],[255,0,0],[0,0,230],[119,11,32],
+            [255,204,54],[0,0,142],[0,0,70],[0,60,100],[136,143,153],[220,190,40],[102,102,156],
+            [190,153,153],[180,165,180],[174,64,67],[220,220,0],[250,170,30],[153,153,153],
+            [169,187,214],[70,70,70],[150,100,100],[107,142,35],[70,130,180]]
+  ignore_index: 255
+  source:
+    mode: glob
+    image_glob: "leftImg8bit/{split}/*/*_leftImg8bit.png"
+    label_from_image: [["leftImg8bit/", "masks/"], ["_leftImg8bit.png", ".png"]]
+    domain_regex: "leftImg8bit/[^/]+/([^/]+)/"
+  label_map: null                                 # masks already hold level-3 train ids
+
+# train: 6993 images / 120 sequences. 10 whole sequences are held out as an unseen-domain
+# val (E4); 10% of every remaining sequence is the seen-domain val. Official val = test.
+splits:
+  train:      {split: train, domains: all}
+  val_unseen: {from: train, holdout_domains: 10}
+  val:        {from: train, fraction: 0.1, per_domain: true}
+  test:       {split: val, domains: all}
+
+transforms:
+  train:
+    - {name: Resize, size: [720, 1280]}
+    - {name: RandomScale, scale: [0.5, 2.0]}
+    - {name: RandomCrop, size: [512, 1024], cat_max_ratio: 0.75}
+    - {name: HorizontalFlip, p: 0.5}
+    - {name: ColorJitter, brightness: 0.3, contrast: 0.3, saturation: 0.3, hue: 0.02, p: 0.8}
+    - {name: GaussianBlur, kernel: 5, sigma: [0.1, 1.5], p: 0.2}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+  val:
+    - {name: Resize, size: [720, 1280]}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+  test:
+    - {name: Resize, size: [720, 1280]}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+
+continual:
+  enabled: true
+  tasks: auto
+  order: sorted
+  num_groups: 6
+  min_images_per_task: 200
+  valid_set: task
+
+model:
+  encoder: {name: segformer, pretrained: nvidia/mit-b2, freeze: true}
+  prototypes:
+    anchors: {source: clip, template: "a photo of a {} on an Indian road"}
+
+loss:
+  ce: {ohem: {thresh: 0.7, min_kept: 100000}}
+
+# Step budget per task instead of epochs: the first task learns the label space,
+# later tasks adapt at 0.3x lr (train.optimizer.later_task_lr_mult).
+train:
+  iters_per_task: [16000, 4000, 4000, 4000, 4000, 4000]
+  batch_size: 8
+  accum_steps: 1
+  num_workers: 8
+  log_interval: 200
+  optimizer: {name: adamw, lr: 6.0e-4, weight_decay: 0.01}
+  scheduler: {name: poly, power: 1.0, warmup_iters: 1500}
+
+eval:
+  batch_size: 4
+  num_workers: 4
+  every: 5
+  print_class_table: false
+  track_seen_every_epoch: false
+
+viz:
+  tsne: {max_images: 60}

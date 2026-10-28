@@ -7,30 +7,39 @@ import os
 import numpy as np
 
 from .engine import evaluate, make_loader
-from .metrics import continual_metrics, format_class_table
+from .metrics import bootstrap_miou, continual_metrics, format_class_table
 from .utils import dump_json, get_palette
 from .viz import plot_samples, plot_test_results, plot_tsne
 
 
-def run_test(model, cfg, samples, device, out_dir, R=None, prefix="test") -> dict:
+def run_test(model, cfg, samples, device, out_dir, R=None, prefix="test", continual=None) -> dict:
     os.makedirs(out_dir, exist_ok=True)
     classes = list(cfg.dataset.classes)
     if cfg.model.inference.get("merge_lora", True) and hasattr(model, "merge_lora"):
         model.merge_lora(True)
     model.eval()
     loader = make_loader(cfg, samples, "test", False, cfg.eval.batch_size, cfg.eval.num_workers)
-    res = evaluate(model, loader, cfg, device, with_loss=True)
+    tta = cfg.model.inference.get("tta")
+    res = evaluate(model, loader, cfg, device, with_loss=True, keep_per_image=True, tta=tta)
+    ci = bootstrap_miou(res.pop("per_image"), n=int(cfg.eval.get("bootstrap", 1000)), seed=cfg.experiment.seed)
 
     print(f"\n================ {prefix.upper()} ({len(samples)} images) ================")
     print(f"mIoU {100 * res['mIoU']:.2f} | IoU(fw) {100 * res['fwIoU']:.2f} | BIoU {100 * res['BIoU']:.2f} | "
           f"Dice {100 * res['Dice']:.2f} | pixel acc {100 * res['pixel_acc']:.2f} | mean acc {100 * res['mean_acc']:.2f}")
+    if ci:
+        print(f"mIoU 95% bootstrap CI over images: [{100 * ci['lo']:.2f}, {100 * ci['hi']:.2f}]  "
+              f"(std {100 * ci['std']:.2f}, {ci['n_images']} images)" + (f"  | TTA {dict(tta)}" if tta else ""))
     print(format_class_table(res, classes, cols=("IoU", "F1", "BIoU", "Prec", "Rec")))
     if res["per_domain_mIoU"]:
         print("per-domain mIoU: " + ", ".join(f"{d} {100 * v:.2f}" for d, v in res["per_domain_mIoU"].items()))
     summary = {k: v for k, v in res.items() if k != "confusion"}
     summary["confusion"] = np.asarray(res["confusion"]).astype(np.int64)
     summary["classes"] = classes
-    if R is not None and (~np.isnan(np.diag(R))).any():
+    summary["mIoU_bootstrap"] = ci
+    if continual:
+        summary["continual"] = continual
+        print("continual: " + ", ".join(f"{k} {100 * v:.2f}" for k, v in continual.items() if isinstance(v, float)))
+    elif R is not None and (~np.isnan(np.diag(R))).any():
         done = int((~np.isnan(np.diag(R))).sum())
         cl = continual_metrics(R[:done, :done])
         summary["continual"] = cl

@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from .components import CosineHead, FusionDecoder, LinearHead, PrototypeGenerator, ShiftEstimator
 from .encoders import build_encoder
-from .lora import LoRALinear, inject_lora, set_lora_merged
+from .lora import LoRALinear, inject_lora, linear_names, set_lora_merged
 
 
 def resolve_modules(mcfg) -> dict[str, bool]:
@@ -39,8 +39,27 @@ def resolve_modules(mcfg) -> dict[str, bool]:
     return m
 
 
+def _load_clip(name: str):
+    from transformers import CLIPModel
+
+    try:
+        return CLIPModel.from_pretrained(name, use_safetensors=True).eval()
+    except Exception:  # noqa: BLE001  - repo has no safetensors: load the .bin with weights_only
+        from huggingface_hub import hf_hub_download
+        from transformers import CLIPConfig
+
+        clip = CLIPModel(CLIPConfig.from_pretrained(name)).eval()
+        sd = torch.load(hf_hub_download(name, "pytorch_model.bin"), map_location="cpu", weights_only=True)
+        missing, unexpected = clip.load_state_dict(sd, strict=False)
+        missing = [k for k in missing if not k.endswith("position_ids")]
+        if missing:
+            raise RuntimeError(f"CLIP checkpoint {name} is missing {len(missing)} weights, e.g. {missing[:3]}")
+        return clip
+
+
 def build_anchors(pcfg, classes, embed_dim: int, seed: int = 0) -> torch.Tensor:
-    """a_c: frozen class anchors [C, D] from a file, CLIP text embeddings or a fixed random draw."""
+    """a_c: frozen class anchors [C, D] from a file, CLIP text embeddings or a fixed random draw.
+    A failed file/CLIP load is an error unless anchors.allow_fallback is true."""
     acfg = pcfg.anchors
     C = len(classes)
     g = torch.Generator().manual_seed(seed)
@@ -48,21 +67,12 @@ def build_anchors(pcfg, classes, embed_dim: int, seed: int = 0) -> torch.Tensor:
     emb = None
     try:
         if src == "file":
-            emb = torch.load(acfg.file, map_location="cpu").float()
+            emb = torch.load(acfg.file, map_location="cpu", weights_only=True).float()
         elif src == "clip":
-            from transformers import CLIPModel, CLIPTokenizer
+            from transformers import CLIPTokenizer
 
             tok = CLIPTokenizer.from_pretrained(acfg.clip_model)
-            try:
-                clip = CLIPModel.from_pretrained(acfg.clip_model, use_safetensors=True).eval()
-            except Exception:  # noqa: BLE001  - no safetensors in the repo: load the .bin safely
-                from huggingface_hub import hf_hub_download
-                from transformers import CLIPConfig
-
-                clip = CLIPModel(CLIPConfig.from_pretrained(acfg.clip_model)).eval()
-                sd = torch.load(hf_hub_download(acfg.clip_model, "pytorch_model.bin"), map_location="cpu",
-                                weights_only=True)
-                clip.load_state_dict(sd, strict=False)
+            clip = _load_clip(acfg.clip_model)
             with torch.no_grad():
                 t = tok([acfg.template.format(c) for c in classes], padding=True, return_tensors="pt")
                 emb = clip.get_text_features(**t)
@@ -70,8 +80,13 @@ def build_anchors(pcfg, classes, embed_dim: int, seed: int = 0) -> torch.Tensor:
                     emb = emb.pooler_output
                 emb = emb.float()
             print(f"[model] anchors: CLIP text embeddings from {acfg.clip_model}")
+        elif src != "random":
+            raise KeyError(f"unknown anchors.source '{src}' (clip | file | random)")
     except Exception as e:  # noqa: BLE001
-        print(f"[model] anchors: could not load '{src}' anchors ({e}); using fixed random anchors")
+        if not acfg.get("allow_fallback", False):
+            raise RuntimeError(f"could not build '{src}' anchors: {e}. Fix the source, or set "
+                               f"model.prototypes.anchors.allow_fallback=true to use random anchors.") from e
+        print(f"[model] WARNING: '{src}' anchors failed ({e}); using fixed random anchors (allow_fallback=true)")
         emb = None
     if emb is None:
         emb = torch.randn(C, embed_dim, generator=g)
@@ -95,33 +110,39 @@ class DRIFT(nn.Module):
         D, S = int(mcfg.embed_dim), int(mcfg.shift_dim)
 
         self.encoder = build_encoder(mcfg.encoder)
-        if mcfg.encoder.get("freeze", True):
+        self.encoder_frozen = bool(mcfg.encoder.get("freeze", True))
+        if self.encoder_frozen:
             for p in self.encoder.parameters():
                 p.requires_grad_(False)
-        self.lora_layers = 0
+        self.lora_layers: list[str] = []
         if self.flags.get("lora"):
             lc = mcfg.lora
             self.lora_layers = inject_lora(self.encoder, lc.targets, lc.rank, lc.alpha, lc.dropout)
-            if self.lora_layers == 0:
-                print(f"[model] warning: LoRA enabled but no Linear named {list(lc.targets)} in the encoder")
+            if not self.lora_layers:
+                names = linear_names(self.encoder)
+                raise RuntimeError(f"LoRA is enabled but no encoder Linear matches {list(lc.targets)}. "
+                                   f"{len(names)} Linear layers exist, e.g. {names[:6]}. Adjust model.lora.targets "
+                                   f"or set model.modules.lora=false.")
         ch = self.encoder.out_channels
 
-        self.decoder = FusionDecoder(ch, D, mcfg.decoder.dropout)
+        self.decoder = FusionDecoder(ch, D, mcfg.decoder.dropout, mcfg.decoder.get("norm", "gn"))
 
         self.shift_estimator = None
         if self.flags.get("shift_estimator"):
             sc = mcfg.shift_estimator
-            self.shift_estimator = ShiftEstimator(ch, S, sc.hidden, sc.use_std, sc.detach_input)
+            self.shift_estimator = ShiftEstimator(ch, S, sc.hidden, sc.use_std, sc.get("detach_input", True))
 
         self.prototypes = None
         if self.flags.get("cosine_head"):
             pc = mcfg.prototypes
             anchors = build_anchors(pc, cfg.dataset.classes, D, cfg.experiment.seed) if self.flags.get("anchors") else None
+            mc = pc.memory
             self.prototypes = PrototypeGenerator(
                 self.num_classes, D, S, use_anchors=self.flags.get("anchors", False),
                 use_memory=self.flags.get("memory", False), use_shift=self.flags.get("shift_library", False),
                 use_base=self.flags.get("learnable_base", False), anchors=anchors,
-                num_slots=pc.memory.num_slots, momentum=pc.memory.momentum, num_bases=pc.shift_library.num_bases)
+                num_slots=mc.num_slots, momentum=mc.momentum, num_bases=pc.shift_library.num_bases,
+                read_tau=mc.get("read_tau", 0.1), term_gains=pc.get("term_gains", True))
             self.head = CosineHead(mcfg.head.tau, mcfg.head.learnable_tau)
         else:
             self.head = LinearHead(D, self.num_classes)
@@ -130,18 +151,24 @@ class DRIFT(nn.Module):
     def forward(self, x, out_size=None):
         feats = self.encoder(x)
         z = self.decoder(feats)
-        s = self.shift_estimator(feats) if self.shift_estimator is not None else None
+        s, stats = self.shift_estimator(feats) if self.shift_estimator is not None else (None, None)
         protos = self.prototypes(s, x.shape[0]) if self.prototypes is not None else None
         logits = self.head(z, protos)
         if out_size is not None:
             logits = F.interpolate(logits, size=out_size, mode="bilinear", align_corners=False)
-        return {"logits": logits, "z": z, "s": s, "protos": protos}
+        return {"logits": logits, "z": z, "s": s, "stats": stats, "protos": protos}
 
     def logits_from(self, z, protos, out_size=None):
         logits = self.head(z, protos)
         if out_size is not None:
             logits = F.interpolate(logits, size=out_size, mode="bilinear", align_corners=False)
         return logits
+
+    def prototypes_from_stats(self, stats, batch_size):
+        """Prototypes from (detached) encoder statistics: gradients reach g_phi's head,
+        W_u, B and the gains, never the encoder or LoRA."""
+        s = self.shift_estimator.head(stats) if (self.shift_estimator is not None and stats is not None) else None
+        return self.prototypes(s, batch_size)
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -153,29 +180,42 @@ class DRIFT(nn.Module):
             return torch.zeros(self.num_classes, dtype=torch.bool)
         return self.prototypes.has_memory().cpu()
 
+    def mark_seen(self, classes_mask: torch.Tensor):
+        if self.prototypes is not None:
+            self.prototypes.class_seen |= classes_mask.to(self.prototypes.class_seen.device)
+
     def merge_lora(self, merged: bool = True):
         set_lora_merged(self.encoder, merged)
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # a fully frozen encoder keeps its normalisation statistics fixed
-        if mode and self.cfg.model.encoder.get("freeze", True):
+        # a frozen encoder runs in eval mode: no stochastic depth / dropout, fixed norm statistics.
+        # LoRA dropout lives inside the LoRALinear wrappers and follows `mode`.
+        if mode and self.encoder_frozen:
+            self.encoder.eval()
             for m in self.encoder.modules():
-                if isinstance(m, nn.modules.batchnorm._BatchNorm):
-                    m.eval()
+                if isinstance(m, LoRALinear):
+                    m.train(mode)
         return self
 
     def param_groups(self) -> dict[str, list[nn.Parameter]]:
-        groups: dict[str, list[nn.Parameter]] = {"encoder": [], "lora": [], "decoder": [],
-                                                 "shift_estimator": [], "prototypes": [], "head": []}
+        """Named groups; 1-d params (norms, biases, gains, tau) and the prototype path go to
+        '<name>_no_wd' so weight decay does not shrink them."""
+        groups: dict[str, list[nn.Parameter]] = {}
         for name, p in self.named_parameters():
             if not p.requires_grad:
                 continue
-            if "lora_" in name:
-                groups["lora"].append(p)
-            else:
-                groups[name.split(".")[0]].append(p)
-        return {k: v for k, v in groups.items() if v}
+            g = "lora" if "lora_" in name else name.split(".")[0]
+            if p.ndim <= 1 or g == "prototypes":
+                g += "_no_wd"
+            groups.setdefault(g, []).append(p)
+        return groups
+
+    def checkpoint_state(self) -> dict:
+        """State dict without frozen encoder weights (they come from `pretrained`)."""
+        frozen = {f"encoder.{n}" for n, p in self.encoder.named_parameters()
+                  if not p.requires_grad and "lora_" not in n} if self.encoder_frozen else set()
+        return {k: v for k, v in self.state_dict().items() if k not in frozen}
 
     def module_report(self) -> str:
         rows = [("encoder", self.encoder, True), ("lora", None, self.flags.get("lora")),
@@ -198,8 +238,9 @@ class DRIFT(nn.Module):
             p = self.prototypes
             parts = [n for n, f in (("anchors", p.use_anchors), ("memory", p.use_memory),
                                     ("shift_library", p.use_shift), ("learnable_base", p.use_base)) if f]
-            lines.append(f"prototype terms: {' + '.join(parts)}   head: cosine (tau={self.head.log_tau.exp().item():.3f})")
+            lines.append(f"prototype terms: {' + '.join(parts)}   memory slots K={p.K}   "
+                         f"head: cosine (tau={self.head.log_tau.exp().item():.3f})")
         else:
             lines.append("head: linear 1x1 classifier")
-        lines.append(f"LoRA layers: {self.lora_layers}")
+        lines.append(f"LoRA layers: {len(self.lora_layers)}   encoder: {'frozen' if self.encoder_frozen else 'trainable'}")
         return "\n".join(lines)

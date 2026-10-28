@@ -1,0 +1,12 @@
+# run outputs, caches and datasets are never committed
+outputs/
+data/
+*.pt
+*.pth
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/

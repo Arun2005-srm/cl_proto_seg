@@ -110,16 +110,23 @@ def load_label(path: str, lut: np.ndarray | None, num_classes: int, ignore_index
     return arr
 
 
+def natural_key(s: str):
+    """Sort '2' before '10' (IDD sequence folders are numbers)."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)]
+
+
 class SegDataset(Dataset):
-    def __init__(self, samples: Sequence[Sample], dcfg, transform=None, return_meta: bool = True):
+    def __init__(self, samples: Sequence[Sample], dcfg, transform=None, return_meta: bool = True,
+                 drop_classes: Sequence[int] = ()):
         self.samples = list(samples)
         self.dcfg = dcfg
         self.num_classes = len(dcfg.classes)
         self.ignore_index = dcfg.ignore_index
         self.lut = build_lut(dcfg)
+        self.drop_classes = list(drop_classes)   # controlled absence: these train ids become ignore
         self.transform = transform
         self.return_meta = return_meta
-        domains = sorted({s.domain for s in self.samples})
+        domains = sorted({s.domain for s in self.samples}, key=natural_key)
         self.domain_to_idx = {d: i for i, d in enumerate(domains)}
 
     def __len__(self):
@@ -127,7 +134,10 @@ class SegDataset(Dataset):
 
     def read_label(self, idx: int) -> np.ndarray:
         s = self.samples[idx]
-        return load_label(s.label, self.lut, self.num_classes, self.ignore_index)
+        lbl = load_label(s.label, self.lut, self.num_classes, self.ignore_index)
+        if self.drop_classes:
+            lbl[np.isin(lbl, self.drop_classes)] = self.ignore_index
+        return lbl
 
     def read_image(self, idx: int) -> Image.Image:
         return Image.open(self.samples[idx].image).convert("RGB")
@@ -159,13 +169,16 @@ def _select_domains(samples: list[Sample], domains) -> list[Sample]:
 
 
 def build_splits(cfg, verbose: bool = True) -> dict[str, list[Sample]]:
-    """Resolve cfg.splits into {'train': [...], 'val': [...], 'test': [...]}.
+    """Resolve cfg.splits into {name: [samples]} for every split named in the config
+    (train / val / test, plus extras such as val_unseen).
 
-    A split is either `{split: <folder>, domains: all|[...]}` or
-    `{from: <other split>, fraction: f, per_domain: bool}` which moves a
-    deterministic random fraction out of that split.
+    A split is one of
+      {split: <folder>, domains: all|[...]}                 a physical folder split
+      {from: <other>, fraction: f, per_domain: bool}         a random fraction moved out of another split
+      {from: <other>, holdout_domains: k | [names]}          whole domains moved out (unseen-domain val)
     """
     scfg = cfg.splits
+    names = [k for k in scfg.keys() if k != "max_samples" and scfg[k]]
     cache: dict[str, list[Sample]] = {}
     out: dict[str, list[Sample]] = {}
     rng = random.Random(cfg.experiment.seed)
@@ -175,17 +188,27 @@ def build_splits(cfg, verbose: bool = True) -> dict[str, list[Sample]]:
             cache[name] = discover_samples(cfg.dataset, name)
         return cache[name]
 
-    for name in ("train", "val", "test"):
-        spec = scfg.get(name)
-        if not spec or "split" not in spec:
-            continue
-        out[name] = _select_domains(physical(spec.split), spec.get("domains", "all"))
+    for name in names:
+        spec = scfg[name]
+        if "split" in spec and "from" not in spec:   # `from` wins when a merge left both keys
+            out[name] = _select_domains(physical(spec.split), spec.get("domains", "all"))
 
-    for name in ("train", "val", "test"):
-        spec = scfg.get(name)
-        if not spec or "from" not in spec:
-            continue
+    # domain hold-outs first, so fractions are carved from what is left
+    derived = [n for n in names if "from" in scfg[n]]
+    derived.sort(key=lambda n: 0 if "holdout_domains" in scfg[n] else 1)
+    for name in derived:
+        spec = scfg[name]
         parent = out[spec["from"]]
+        if "holdout_domains" in spec:
+            hd = spec["holdout_domains"]
+            doms = sorted({s.domain for s in parent}, key=natural_key)
+            if isinstance(hd, int):
+                hd = sorted(random.Random(cfg.experiment.seed + 1).sample(doms, min(hd, len(doms) - 1)),
+                            key=natural_key)
+            hd = set(hd)
+            out[name] = [s for s in parent if s.domain in hd]
+            out[spec["from"]] = [s for s in parent if s.domain not in hd]
+            continue
         frac = float(spec.get("fraction", 0.1))
         groups: dict[str, list[Sample]] = {}
         for s in parent:
@@ -211,15 +234,40 @@ def build_splits(cfg, verbose: bool = True) -> dict[str, list[Sample]]:
             out[name] = [s for g in by_dom.values() for s in g[:per]]
     if verbose:
         for name, lst in out.items():
-            doms = sorted({s.domain for s in lst})
-            print(f"[data] {name:5s}: {len(lst):6d} samples, {len(doms)} domains")
+            doms = sorted({s.domain for s in lst}, key=natural_key)
+            print(f"[data] {name:10s}: {len(lst):6d} samples, {len(doms)} domains")
     return out
 
 
+def _balanced_groups(domains: list[str], counts: dict[str, int], n: int) -> list[list[str]]:
+    """Split an ordered domain list into n contiguous groups with similar image counts."""
+    n = max(1, min(n, len(domains)))
+    total = sum(counts[d] for d in domains)
+    groups, cur, acc = [], [], 0
+    for i, d in enumerate(domains):
+        cur.append(d)
+        acc += counts[d]
+        left_groups = n - len(groups) - 1
+        left_domains = len(domains) - i - 1
+        if left_groups > 0 and (acc >= total * (len(groups) + 1) / n or left_domains == left_groups):
+            groups.append(cur)
+            cur = []
+    if cur:
+        groups.append(cur)
+    return groups
+
+
 def build_tasks(cfg, train_samples: list[Sample]) -> list[list[str]]:
-    """Continual tasks as lists of domains."""
+    """Continual tasks as lists of domains.
+
+    tasks: auto groups domains by `group_size` (domains per task) or `num_groups`
+    (that many tasks with balanced image counts); `min_images_per_task` then merges
+    any task that is still too small into its neighbour."""
     ccfg = cfg.continual
-    domains = sorted({s.domain for s in train_samples})
+    counts: dict[str, int] = {}
+    for s in train_samples:
+        counts[s.domain] = counts.get(s.domain, 0) + 1
+    domains = sorted(counts, key=natural_key)
     if not ccfg.enabled:
         return [domains]
     if ccfg.tasks == "auto":
@@ -231,13 +279,27 @@ def build_tasks(cfg, train_samples: list[Sample]) -> list[list[str]]:
                 if s.domain not in seen:
                     seen.add(s.domain)
                     domains.append(s.domain)
-        g = int(ccfg.group_size)
-        tasks = [domains[i:i + g] for i in range(0, len(domains), g)]
+        if ccfg.get("num_groups"):
+            tasks = _balanced_groups(domains, counts, int(ccfg.num_groups))
+        else:
+            g = int(ccfg.group_size)
+            tasks = [domains[i:i + g] for i in range(0, len(domains), g)]
     else:
-        tasks = [list(t) if isinstance(t, (list, tuple)) else [t] for t in ccfg.tasks]
+        tasks = [list(map(str, t)) if isinstance(t, (list, tuple)) else [str(t)] for t in ccfg.tasks]
         unknown = {d for t in tasks for d in t} - set(domains)
         if unknown:
             raise ValueError(f"continual.tasks names unknown domains {sorted(unknown)}; found {domains}")
+    min_imgs = int(ccfg.get("min_images_per_task") or 0)
+    if min_imgs:
+        merged: list[list[str]] = []
+        for t in tasks:
+            if merged and sum(counts[d] for d in merged[-1]) < min_imgs:
+                merged[-1] = merged[-1] + t
+            else:
+                merged.append(list(t))
+        if len(merged) > 1 and sum(counts[d] for d in merged[-1]) < min_imgs:
+            merged[-2] += merged.pop()
+        tasks = merged
     if ccfg.get("num_tasks"):
         tasks = tasks[: int(ccfg.num_tasks)]
     return tasks
