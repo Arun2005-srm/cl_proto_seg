@@ -74,7 +74,9 @@ def ce_loss(logits, target, weight, ignore_index, label_smoothing=0.0, ohem=None
     pix = F.cross_entropy(logits, target, weight=weight, ignore_index=ignore_index,
                           label_smoothing=label_smoothing, reduction="none")[valid]
     with torch.no_grad():
-        p_true = logits.float().softmax(1).gather(1, target.clamp(min=0).unsqueeze(1)).squeeze(1)[valid]
+        # clamp both ends: ignore pixels (255) must not index past the class dim; they are dropped by [valid]
+        idx = target.clamp(0, logits.shape[1] - 1).unsqueeze(1)
+        p_true = logits.float().softmax(1).gather(1, idx).squeeze(1)[valid]
         keep = p_true < ohem.get("thresh", 0.7)
         min_kept = min(int(ohem.get("min_kept", 100000)), pix.numel())
         if keep.sum() < min_kept:

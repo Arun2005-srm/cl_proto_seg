@@ -182,6 +182,26 @@ def test_N1_ce_with_no_labelled_pixels_is_zero_and_finite():
     assert l.item() == 0 and torch.isfinite(logits.grad).all()
 
 
+def test_ohem_with_ignore_pixels_does_not_index_out_of_range():
+    torch.manual_seed(0)
+    logits = torch.randn(2, C, 8, 8, requires_grad=True)
+    y = torch.randint(0, C, (2, 8, 8))
+    y[:, :3] = 255                                   # ignore pixels, as in every real mask
+    l = ce_loss(logits, y, None, 255, ohem={"thresh": 0.7, "min_kept": 10})
+    l.backward()
+    assert torch.isfinite(l) and torch.isfinite(logits.grad).all()
+
+
+def test_full_loss_with_ohem_config_and_ignore_pixels():
+    cfg = tiny_cfg(**{"loss.ce.ohem": {"thresh": 0.7, "min_kept": 50}})
+    model, crit, out, y, allowed, hidden = _forward_loss(cfg)
+    y = y.clone()
+    y[:, :5] = 255
+    loss, _, _, _ = crit(model, out, y, allowed, model.memory_mask(), hidden)
+    loss.backward()
+    assert torch.isfinite(loss)
+
+
 # ---------------------------------------------------------------- architecture (A1, A3, LoRA)
 def test_A1_decoder_uses_groupnorm_and_runs_with_batch_1():
     dec = FusionDecoder([8, 16], 32, 0.0, "gn")
