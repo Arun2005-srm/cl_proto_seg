@@ -139,7 +139,7 @@ train:
 eval:
   batch_size: 4
   num_workers: 8
-  every: 10
+  every: 1                            # validate every epoch: all metrics + per-class table
   every_iters: null
   print_class_table: true
   track_seen_every_epoch: false

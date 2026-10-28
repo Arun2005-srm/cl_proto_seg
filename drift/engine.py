@@ -610,6 +610,10 @@ class Trainer:
             s += f" | seen-avg mIoU {100 * r['seen_avg_mIoU']:.2f}"
         parts = [f"{k[11:]} {v:.3f}" for k, v in r.items() if k.startswith("train_loss_")]
         s += f" | {r['time_s']:.0f}s"
+        done_t = [h["time_s"] for h in self.history if h["task"] == t]
+        left = epochs - r["epoch"]
+        if left > 0 and done_t:
+            s += f" | ETA task {left * float(np.mean(done_t[-3:])) / 3600:.1f}h"
         print(s)
         print(f"    loss terms: {', '.join(parts)}  hidden-iters {100 * r['train_hidden_iter_frac']:.0f}%  lr {r['lr']:.2e}")
         if "IoU_per_class" in r and cfg.eval.print_class_table:
