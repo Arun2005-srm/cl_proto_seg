@@ -3,6 +3,11 @@
 Nothing here knows about Cityscapes. Everything comes from `cfg.dataset`:
 where images are, how to find each image's label, how to read the domain
 (city) from a path, and how raw label ids map to train ids.
+
+Several datasets can be combined as domains (cross-dataset continual learning):
+`dataset.domains: {name: {root, source, label_map, splits}}`. Each sample then
+carries `source` (its dataset, which selects its label map) and its domain is the
+dataset name; the original city/sequence is kept in `subdomain`.
 """
 from __future__ import annotations
 
@@ -23,8 +28,31 @@ from torch.utils.data import Dataset
 class Sample:
     image: str          # absolute path
     label: str          # absolute path
-    domain: str         # city / site / "all"
+    domain: str         # city / site / dataset name / "all"
     rel: str            # image path relative to root (forward slashes)
+    source: str = ""    # dataset name in a multi-dataset config ("" for a single dataset)
+    subdomain: str = "" # original domain (city / sequence) when `domain` is the dataset name
+
+    @property
+    def key(self) -> str:
+        """Unique across datasets (rel paths of two datasets can coincide)."""
+        return f"{self.source}|{self.rel}" if self.source else self.rel
+
+
+def is_multi(dcfg) -> bool:
+    return bool(dcfg.get("domains"))
+
+
+def sub_dataset_cfg(dcfg, name: str):
+    """Config of one dataset inside a multi-dataset config: shared keys (classes, palette,
+    ignore_index, ...) plus that dataset's own root / source / label_map."""
+    from ..config import Config
+
+    base = {k: v for k, v in dcfg.to_dict().items() if k != "domains"}
+    own = {k: v for k, v in dcfg.domains[name].to_dict().items() if k != "splits"}
+    base.update(own)
+    base["name"] = name
+    return Config(base)
 
 
 def _rel(path: str, root: str) -> str:
@@ -122,7 +150,8 @@ class SegDataset(Dataset):
         self.dcfg = dcfg
         self.num_classes = len(dcfg.classes)
         self.ignore_index = dcfg.ignore_index
-        self.lut = build_lut(dcfg)
+        self.lut = build_lut(dcfg) if not is_multi(dcfg) else None
+        self.luts = {n: build_lut(sub_dataset_cfg(dcfg, n)) for n in dcfg.domains} if is_multi(dcfg) else {}
         self.drop_classes = list(drop_classes)   # controlled absence: these train ids become ignore
         self.transform = transform
         self.return_meta = return_meta
@@ -134,7 +163,8 @@ class SegDataset(Dataset):
 
     def read_label(self, idx: int) -> np.ndarray:
         s = self.samples[idx]
-        lbl = load_label(s.label, self.lut, self.num_classes, self.ignore_index)
+        lut = self.luts[s.source] if s.source else self.lut
+        lbl = load_label(s.label, lut, self.num_classes, self.ignore_index)
         if self.drop_classes:
             lbl[np.isin(lbl, self.drop_classes)] = self.ignore_index
         return lbl
@@ -147,7 +177,8 @@ class SegDataset(Dataset):
         img = self.read_image(idx)
         lbl = self.read_label(idx)
         mode = "L" if self.num_classes < 255 and self.ignore_index <= 255 else "I"
-        lbl_img = Image.fromarray(lbl.astype(np.uint8 if mode == "L" else np.int32), mode=mode)
+        # dtype picks the mode (uint8 -> "L", int32 -> "I"); the `mode=` argument is removed in Pillow 13
+        lbl_img = Image.fromarray(lbl.astype(np.uint8 if mode == "L" else np.int32))
         if self.transform is not None:
             img_t, lbl_t = self.transform(img, lbl_img)
         else:
@@ -169,23 +200,57 @@ def _select_domains(samples: list[Sample], domains) -> list[Sample]:
 
 
 def build_splits(cfg, verbose: bool = True) -> dict[str, list[Sample]]:
-    """Resolve cfg.splits into {name: [samples]} for every split named in the config
+    """Resolve the splits into {name: [samples]} for every split named in the config
     (train / val / test, plus extras such as val_unseen).
 
     A split is one of
       {split: <folder>, domains: all|[...]}                 a physical folder split
       {from: <other>, fraction: f, per_domain: bool}         a random fraction moved out of another split
       {from: <other>, holdout_domains: k | [names]}          whole domains moved out (unseen-domain val)
+
+    Multi-dataset configs (`dataset.domains`) give each dataset its own `splits` block; the
+    splits are built per dataset (stratified by its cities / sequences) and then merged, with
+    every sample's domain set to its dataset name.
     """
-    scfg = cfg.splits
+    seed = cfg.experiment.seed
+    if is_multi(cfg.dataset):
+        out: dict[str, list[Sample]] = {}
+        for name in cfg.dataset.domains:
+            sub = sub_dataset_cfg(cfg.dataset, name)
+            part = _splits_for(sub, cfg.dataset.domains[name].splits, seed, source=name)
+            for split, lst in part.items():
+                for s in lst:
+                    s.source, s.subdomain, s.domain = name, s.domain, name
+                out.setdefault(split, []).extend(lst)
+            if verbose:
+                print(f"[data] {name}: " + ", ".join(f"{k} {len(v)}" for k, v in part.items()))
+    else:
+        out = _splits_for(cfg.dataset, cfg.splits, seed)
+    caps = (cfg.get("splits", {}) or {}).get("max_samples", {}) or {}
+    for name, lst in out.items():
+        cap = caps.get(name)
+        if cap:
+            by_dom: dict[str, list[Sample]] = {}
+            for s in lst:
+                by_dom.setdefault(s.domain, []).append(s)
+            per = max(1, int(cap) // max(1, len(by_dom)))
+            out[name] = [s for g in by_dom.values() for s in g[:per]]
+    if verbose:
+        for name, lst in out.items():
+            doms = sorted({s.domain for s in lst}, key=natural_key)
+            print(f"[data] {name:10s}: {len(lst):6d} samples, {len(doms)} domains")
+    return out
+
+
+def _splits_for(dcfg, scfg, seed: int, source: str = "") -> dict[str, list[Sample]]:
     names = [k for k in scfg.keys() if k != "max_samples" and scfg[k]]
     cache: dict[str, list[Sample]] = {}
     out: dict[str, list[Sample]] = {}
-    rng = random.Random(cfg.experiment.seed)
+    rng = random.Random(seed)
 
     def physical(name):
         if name not in cache:
-            cache[name] = discover_samples(cfg.dataset, name)
+            cache[name] = discover_samples(dcfg, name)
         return cache[name]
 
     for name in names:
@@ -203,8 +268,7 @@ def build_splits(cfg, verbose: bool = True) -> dict[str, list[Sample]]:
             hd = spec["holdout_domains"]
             doms = sorted({s.domain for s in parent}, key=natural_key)
             if isinstance(hd, int):
-                hd = sorted(random.Random(cfg.experiment.seed + 1).sample(doms, min(hd, len(doms) - 1)),
-                            key=natural_key)
+                hd = sorted(random.Random(seed + 1).sample(doms, min(hd, len(doms) - 1)), key=natural_key)
             hd = set(hd)
             out[name] = [s for s in parent if s.domain in hd]
             out[spec["from"]] = [s for s in parent if s.domain not in hd]
@@ -222,20 +286,6 @@ def build_splits(cfg, verbose: bool = True) -> dict[str, list[Sample]]:
             kept += g[k:]
         out[name] = sorted(taken, key=lambda s: s.rel)
         out[spec["from"]] = sorted(kept, key=lambda s: s.rel)
-
-    caps = scfg.get("max_samples", {}) or {}
-    for name, lst in out.items():
-        cap = caps.get(name)
-        if cap:
-            by_dom: dict[str, list[Sample]] = {}
-            for s in lst:
-                by_dom.setdefault(s.domain, []).append(s)
-            per = max(1, int(cap) // max(1, len(by_dom)))
-            out[name] = [s for g in by_dom.values() for s in g[:per]]
-    if verbose:
-        for name, lst in out.items():
-            doms = sorted({s.domain for s in lst}, key=natural_key)
-            print(f"[data] {name:10s}: {len(lst):6d} samples, {len(doms)} domains")
     return out
 
 

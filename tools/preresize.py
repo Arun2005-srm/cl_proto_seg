@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PIL import Image  # noqa: E402
 
 from drift.config import load_config  # noqa: E402
-from drift.data.datasets import discover_samples  # noqa: E402
+from drift.data.datasets import discover_samples, is_multi, sub_dataset_cfg  # noqa: E402
 
 
 def _job(args):
@@ -30,6 +30,9 @@ def _job(args):
     os.makedirs(os.path.dirname(img_dst), exist_ok=True)
     os.makedirs(os.path.dirname(lbl_dst), exist_ok=True)
     im = Image.open(img_src).convert("RGB")
+    if w <= 0:                       # short-side mode: h is the short side, aspect ratio kept
+        s = h / min(im.size)
+        w, h = round(im.size[0] * s), round(im.size[1] * s)
     if im.size != (w, h):
         im = im.resize((w, h), Image.BILINEAR)
     if jpg:
@@ -47,26 +50,50 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--dst", required=True, help="new dataset root")
-    ap.add_argument("--size", type=int, nargs=2, default=[720, 1280], metavar=("H", "W"))
+    ap.add_argument("--size", type=int, nargs=2, default=None, metavar=("H", "W"),
+                    help="fixed output size (may change the aspect ratio)")
+    ap.add_argument("--short-side", type=int, default=None,
+                    help="resize so the short side has this length, keeping the aspect ratio")
     ap.add_argument("--splits", nargs="*", default=["train", "val"], help="physical split folders")
     ap.add_argument("--jpg", action="store_true", help="store images as JPEG instead of PNG")
     ap.add_argument("--workers", type=int, default=16)
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    root = os.path.abspath(cfg.dataset.root)
-    h, w = args.size
+    if is_multi(cfg.dataset):          # one sub-folder per dataset under --dst
+        for name in cfg.dataset.domains:
+            sub = sub_dataset_cfg(cfg.dataset, name)
+            splits = sorted({v["split"] for v in cfg.dataset.domains[name].splits.values()
+                             if isinstance(v, dict) and "split" in v and "from" not in v})
+            print(f"== {name}: splits {splits}")
+            run_one(sub, os.path.join(args.dst, name), splits, args)
+        print(f"use with:\n  --opts " + " ".join(
+            f'"dataset.domains.{n}.root={os.path.join(args.dst, n)}"' for n in cfg.dataset.domains))
+        if args.jpg:
+            print("  plus each dataset's image_glob / label_from_image changed from .png to .jpg")
+        return
+    run_one(cfg.dataset, args.dst, args.splits, args, print_opts=True)
+
+
+def run_one(dcfg, dst, splits, args, print_opts=False):
+    if args.short_side:
+        h, w = args.short_side, 0
+    elif args.size:
+        h, w = args.size
+    else:
+        raise SystemExit("give --short-side N or --size H W")
+    root = os.path.abspath(dcfg.root)
     jobs, lists = [], {}
-    for split in args.splits:
-        for s in discover_samples(cfg.dataset, split):
+    for split in splits:
+        for s in discover_samples(dcfg, split):
             rel_img = s.rel
             rel_lbl = os.path.relpath(s.label, root).replace("\\", "/")
             if args.jpg:
                 rel_img = os.path.splitext(rel_img)[0] + ".jpg"
-            jobs.append((s.image, os.path.join(args.dst, rel_img), s.label, os.path.join(args.dst, rel_lbl),
+            jobs.append((s.image, os.path.join(dst, rel_img), s.label, os.path.join(dst, rel_lbl),
                          h, w, args.jpg))
             lists.setdefault(split, []).append(f"{rel_img} {rel_lbl}")
-    print(f"resizing {len(jobs)} image/label pairs to {h}x{w} into {args.dst}")
+    print(f"resizing {len(jobs)} image/label pairs to {f'short side {h}' if w <= 0 else f'{h}x{w}'} into {dst}")
     done = 0
     with Pool(args.workers) as pool:
         for i, r in enumerate(pool.imap_unordered(_job, jobs, chunksize=8)):
@@ -74,11 +101,11 @@ def main():
             if (i + 1) % 500 == 0:
                 print(f"  {i + 1}/{len(jobs)}", flush=True)
     print(f"done: {done} written, {len(jobs) - done} already present")
-    opts = [f"dataset.root={args.dst}"]
-    src = cfg.dataset.source
+    opts = [f"dataset.root={dst}"]
+    src = dcfg.source
     if src.mode == "list":       # write the same list file(s) under the new root, with the new image names
         for split, lines in lists.items():
-            lf = os.path.join(args.dst, src.list_file.format(split=split))
+            lf = os.path.join(dst, src.list_file.format(split=split))
             os.makedirs(os.path.dirname(lf) or ".", exist_ok=True)
             with open(lf, "w", encoding="utf-8") as fh:
                 fh.write("\n".join(lines) + "\n")
@@ -87,7 +114,8 @@ def main():
         repl = [[a, b] for a, b in (src.label_from_image or [])]
         repl = [[a.replace(".png", ".jpg") if a.endswith(".png") and "leftImg8bit" in a else a, b] for a, b in repl]
         opts += [f"dataset.source.image_glob={glob_}", f"dataset.source.label_from_image={repl}"]
-    print("use with:\n  --opts " + " ".join(f'"{o}"' for o in opts))
+    if print_opts:
+        print("use with:\n  --opts " + " ".join(f'"{o}"' for o in opts))
 
 
 if __name__ == "__main__":

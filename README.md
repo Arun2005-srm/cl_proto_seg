@@ -43,7 +43,26 @@ python tools/train.py --config configs/idd.yaml
 python tools/test.py  --config configs/idd.yaml --ckpt outputs/idd_drift/<run>/task5.pt
 ```
 
-### Fast IDD training (recommended)
+### Main experiment: Cityscapes → IDD (cross-dataset, domain-incremental)
+
+`configs/cs_idd.yaml` (DRIFT as designed: frozen encoder + LoRA) and `configs/cs_idd_ft.yaml`
+(encoder fine-tuned + TTA):
+- **Tasks:** one per dataset, in order. BDD100K can be added as a third task; the config has a commented block.
+- **Labels:** the 19 Cityscapes classes. IDD is mapped to them, and IDD classes without a counterpart become ignore. `train` is genuinely absent from IDD.
+- **Schedule:** 30 epochs per task, identical for every task.
+- **Splits:** each dataset's official val is its test set, and 10% of its train is val.
+- **Results:** test mIoU per dataset plus their mean, and forgetting on Cityscapes after learning IDD.
+
+```bash
+python tools/preresize.py --config configs/cs_idd.yaml --dst /raid/workspace/cs_idd_720 --short-side 720
+python tools/train.py --config configs/cs_idd.yaml --opts \
+  dataset.domains.cityscapes.root=/raid/workspace/cs_idd_720/cityscapes \
+  dataset.domains.idd.root=/raid/workspace/cs_idd_720/idd
+```
+
+(`preresize.py` reads the original locations from `dataset.domains.*.root` in the config.)
+
+### Fast IDD training (IDD-only protocol)
 
 `configs/idd_fast.yaml` (LoRA) and `configs/idd_fast_ft.yaml` (encoder fine-tuned + TTA, the
 highest-scoring setting) train each task for a fixed number of steps instead of epochs:

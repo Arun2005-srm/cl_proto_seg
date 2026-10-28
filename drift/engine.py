@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import functools
 import hashlib
 import json
 import math
@@ -47,31 +48,42 @@ class _Presence(Dataset):
 def class_presence(cfg, samples, cache_dir: str, num_workers: int) -> np.ndarray:
     """[N, C] bool presence per sample, cached on disk by image path."""
     os.makedirs(cache_dir, exist_ok=True)
-    key = hashlib.md5((str(cfg.dataset.root) + str(cfg.dataset.get("label_map"))).encode()).hexdigest()[:10]
+    d = cfg.dataset
+    ident = str(d.get("root")) + str(d.get("label_map")) + str(d.get("domains"))
+    key = hashlib.md5(ident.encode()).hexdigest()[:10]
     path = os.path.join(cache_dir, f"presence_{cfg.dataset.name}_{key}.json")
     cache = {}
     if os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as f:
             cache = json.load(f)
-    todo = [s for s in samples if s.rel not in cache]
+    todo = [s for s in samples if s.key not in cache]
     if todo:
         ds = SegDataset(todo, cfg.dataset)
         dl = DataLoader(_Presence(ds), batch_size=16, num_workers=num_workers)
         rows = [r for b in dl for r in b.numpy()]
         for s, r in zip(todo, rows):
-            cache[s.rel] = np.nonzero(r)[0].tolist()
+            cache[s.key] = np.nonzero(r)[0].tolist()
         with open(path, "w", encoding="utf-8") as f:
             json.dump(cache, f)
     C = len(cfg.dataset.classes)
     out = np.zeros((len(samples), C), dtype=bool)
     for i, s in enumerate(samples):
-        out[i, cache[s.rel]] = True
+        out[i, cache[s.key]] = True
     return out
 
 
-def _collate(batch):
-    return {"image": torch.stack([b["image"] for b in batch]),
-            "label": torch.stack([b["label"] for b in batch]),
+def _pad_stack(tensors, value):
+    """Stack tensors of different H, W by padding bottom/right (ignore label / zero image)."""
+    h = max(t.shape[-2] for t in tensors)
+    w = max(t.shape[-1] for t in tensors)
+    if all(t.shape[-2] == h and t.shape[-1] == w for t in tensors):
+        return torch.stack(tensors)
+    return torch.stack([F.pad(t, (0, w - t.shape[-1], 0, h - t.shape[-2]), value=value) for t in tensors])
+
+
+def _collate(batch, ignore_index: int = 255):
+    return {"image": _pad_stack([b["image"] for b in batch], 0.0),
+            "label": _pad_stack([b["label"] for b in batch], ignore_index),
             "index": torch.tensor([b["index"] for b in batch]),
             "domain": torch.tensor([b["domain"] for b in batch])}
 
@@ -88,7 +100,8 @@ def make_loader(cfg, samples, split: str, shuffle: bool, batch_size: int, num_wo
     extra = {"prefetch_factor": int(cfg.train.get("prefetch_factor", 4))} if num_workers > 0 else {}
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, sampler=sampler, num_workers=num_workers,
                       pin_memory=torch.cuda.is_available(), drop_last=drop_last and len(ds) >= batch_size,
-                      collate_fn=_collate, persistent_workers=num_workers > 0, **extra)
+                      collate_fn=functools.partial(_collate, ignore_index=cfg.dataset.ignore_index),
+                      persistent_workers=num_workers > 0, **extra)
 
 
 # ============================================================================ optim

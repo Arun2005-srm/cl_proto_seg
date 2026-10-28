@@ -202,6 +202,52 @@ def test_full_loss_with_ohem_config_and_ignore_pixels():
     assert torch.isfinite(loss)
 
 
+# ---------------------------------------------------------------- cross-dataset (multi-dataset) loading
+def _write_ds(root, layout, split, seqs, size, ids):
+    from PIL import Image
+    for seq in seqs:
+        for k in range(3):
+            if layout == "cs":
+                img = os.path.join(root, "leftImg8bit", split, seq, f"{seq}_{k:06d}_000019_leftImg8bit.png")
+                lbl = os.path.join(root, "gtFine", split, seq, f"{seq}_{k:06d}_000019_gtFine_labelIds.png")
+            else:
+                img = os.path.join(root, "leftImg8bit", split, seq, f"{k:06d}_leftImg8bit.png")
+                lbl = os.path.join(root, "masks", split, seq, f"{k:06d}.png")
+            os.makedirs(os.path.dirname(img), exist_ok=True)
+            os.makedirs(os.path.dirname(lbl), exist_ok=True)
+            Image.fromarray(np.random.randint(0, 255, (*size, 3), dtype=np.uint8)).save(img)
+            arr = np.full(size, ids[0], dtype=np.uint8)
+            arr[: size[0] // 2] = ids[1]
+            Image.fromarray(arr).save(lbl)
+
+
+def test_cross_dataset_splits_label_maps_and_mixed_sizes(tmp_path):
+    from functools import partial
+    from torch.utils.data import DataLoader
+    from drift.data.datasets import SegDataset, build_splits
+    from drift.data.transforms import build_transforms
+    from drift.engine import _collate
+
+    cs, idd = str(tmp_path / "cs"), str(tmp_path / "idd")
+    for sp in ("train", "val"):
+        _write_ds(cs, "cs", sp, ["aachen", "bochum"], (16, 32), (7, 23))      # labelIds road, sky
+        _write_ds(idd, "idd", sp, ["0", "10"], (18, 32), (0, 8))             # level3 road, autorickshaw
+    cfg = load_config(os.path.join(ROOT, "configs", "cs_idd.yaml"),
+                      [f"dataset.domains.cityscapes.root={cs}", f"dataset.domains.idd.root={idd}"])
+    splits = build_splits(cfg, verbose=False)
+    assert {s.domain for s in splits["train"]} == {"cityscapes", "idd"}
+    assert {s.subdomain for s in splits["train"] if s.source == "idd"} == {"0", "10"}
+    assert len(splits["test"]) == 12 and len(splits["val"]) == 4      # 1 per city/sequence carved
+    ds = SegDataset(splits["test"], cfg.dataset, transform=build_transforms(cfg.transforms.test))
+    by_src = {s.source: i for i, s in enumerate(ds.samples)}
+    cs_lbl, idd_lbl = ds.read_label(by_src["cityscapes"]), ds.read_label(by_src["idd"])
+    assert set(np.unique(cs_lbl)) == {0, 10}          # road, sky in Cityscapes train ids
+    assert set(np.unique(idd_lbl)) == {0, 255}        # road; autorickshaw -> ignore
+    dl = DataLoader(ds, batch_size=len(ds), collate_fn=partial(_collate, ignore_index=255))
+    b = next(iter(dl))                                # different image sizes in one batch
+    assert b["image"].shape[0] == len(ds) and b["label"].shape[-2:] == b["image"].shape[-2:]
+
+
 # ---------------------------------------------------------------- architecture (A1, A3, LoRA)
 def test_A1_decoder_uses_groupnorm_and_runs_with_batch_1():
     dec = FusionDecoder([8, 16], 32, 0.0, "gn")

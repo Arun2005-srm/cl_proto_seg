@@ -4,6 +4,7 @@ image / ground truth / prediction panels."""
 from __future__ import annotations
 
 import os
+import warnings
 
 import numpy as np
 import torch
@@ -170,8 +171,11 @@ def plot_class_forgetting(Rc, classes, out_dir, dpi=120):
     ax.set_xticks(np.arange(len(classes)), classes, rotation=60, ha="right")
     ax.set_yticks(np.arange(done), [f"after T{i}" for i in range(done)]); ax.grid(False)
     if done > 1:
-        f = np.nanmax(M[:-1], axis=0) - M[-1]
-        ax.set_title(f"Class IoU on pooled seen-task val (avg class forgetting {np.nanmean(f):.2f} pts)")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)   # classes absent so far
+            f = np.nanmax(M[:-1], axis=0) - M[-1]
+            avg_f = np.nanmean(f)
+        ax.set_title(f"Class IoU on pooled seen-task val (avg class forgetting {avg_f:.2f} pts)")
     else:
         ax.set_title("Class IoU on pooled seen-task val")
     fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01, label="IoU %")

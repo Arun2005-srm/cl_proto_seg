@@ -9,6 +9,8 @@ Note: pixel-level Dice and F1 are the same formula, 2TP / (2TP + FP + FN).
 """
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -158,7 +160,10 @@ def class_forgetting(Rc: np.ndarray) -> dict:
     T = Rc.shape[0]
     if T < 2:
         return {"avg_class_forgetting": 0.0, "class_forgetting": [0.0] * Rc.shape[1]}
-    best = np.nanmax(Rc[:-1], axis=0)
+    # classes never present in earlier stages have no best value (NaN, reported as None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        best = np.nanmax(Rc[:-1], axis=0)
     f = best - Rc[-1]
     return {"avg_class_forgetting": float(np.nanmean(f)) if np.isfinite(f).any() else 0.0,
             "class_forgetting": [None if np.isnan(x) else float(x) for x in f]}

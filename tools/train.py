@@ -48,7 +48,8 @@ def main():
     if not args.no_test and "test" in trainer.splits:
         summary = run_test(trainer.model, cfg, trainer.splits["test"], trainer.device, fig_dir, R=trainer.R,
                            continual=trainer.continual_summary())
-        dump_json({"test": {k: summary[k] for k in ("mIoU", "fwIoU", "BIoU", "Dice", "pixel_acc", "mIoU_bootstrap")},
+        keys = ("mIoU", "mean_domain_mIoU", "per_domain_mIoU", "fwIoU", "BIoU", "Dice", "pixel_acc", "mIoU_bootstrap")
+        dump_json({"test": {k: summary[k] for k in keys if k in summary},
                    "continual": trainer.continual_summary(), "shift_diagnostics": trainer.diag,
                    "test_curve": trainer.test_curve}, os.path.join(run_dir, "results.json"))
     print(f"[run] done -> {run_dir}")

@@ -1,0 +1,17 @@
+# Same protocol as cs_idd.yaml, with the MiT-B2 encoder fine-tuned at 0.1x lr instead of
+# frozen + LoRA, and multi-scale + flip test-time augmentation at the final test.
+# Usually the higher-scoring variant; compare forgetting on Cityscapes against cs_idd.yaml.
+_base_: cs_idd.yaml
+
+experiment:
+  name: cs_idd_drift_ft
+
+model:
+  modules: {lora: false}
+  encoder: {freeze: false}
+  inference:
+    tta: {scales: [0.75, 1.0, 1.25], flip: true}
+
+train:
+  optimizer:
+    lr_mult: {encoder: 0.1}

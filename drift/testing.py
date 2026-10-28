@@ -32,6 +32,10 @@ def run_test(model, cfg, samples, device, out_dir, R=None, prefix="test", contin
     print(format_class_table(res, classes, cols=("IoU", "F1", "BIoU", "Prec", "Rec")))
     if res["per_domain_mIoU"]:
         print("per-domain mIoU: " + ", ".join(f"{d} {100 * v:.2f}" for d, v in res["per_domain_mIoU"].items()))
+        if len(res["per_domain_mIoU"]) > 1:
+            res["mean_domain_mIoU"] = float(np.mean(list(res["per_domain_mIoU"].values())))
+            print(f"mean mIoU over domains: {100 * res['mean_domain_mIoU']:.2f}  "
+                  f"(each domain weighted equally; 'mIoU' above pools all test pixels)")
     summary = {k: v for k, v in res.items() if k != "confusion"}
     summary["confusion"] = np.asarray(res["confusion"]).astype(np.int64)
     summary["classes"] = classes

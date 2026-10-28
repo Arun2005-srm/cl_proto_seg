@@ -1,0 +1,148 @@
+# Cross-dataset domain-incremental segmentation: Cityscapes -> IDD (-> BDD100K, optional).
+#
+# Protocol
+#   - one task per dataset, learned in this order; no image of a finished task is ever seen again
+#   - shared label space: the 19 Cityscapes classes; IDD's 26 level-3 classes are mapped below,
+#     classes with no Cityscapes counterpart become ignore (255)
+#   - IDD has no `train` (rail vehicle) class, so it is genuinely absent in task 2
+#   - the same schedule for every task: 30 epochs, same lr, same warm-up (no special first task)
+#   - train = each dataset's official train minus 10% (stratified by city / sequence) as val;
+#     test = each dataset's official val (Cityscapes 500 images, IDD 981)
+#   - report: test mIoU per dataset, their mean, forgetting on Cityscapes after IDD
+#
+# Images are resized so the short side is 720 (aspect ratio kept: Cityscapes 720x1440,
+# IDD 720x1280) and trained on random 512x1024 crops.
+#
+#   python tools/train.py --config configs/cs_idd.yaml \
+#     --opts dataset.domains.cityscapes.root=/path/to/cityscapes dataset.domains.idd.root=/path/to/idd
+_base_: defaults.yaml
+
+experiment:
+  name: cs_idd_drift
+  amp_dtype: bf16
+  tf32: true
+
+dataset:
+  name: cs_idd
+  classes: [road, sidewalk, building, wall, fence, pole, traffic light, traffic sign,
+            vegetation, terrain, sky, person, rider, car, truck, bus, train, motorcycle, bicycle]
+  palette: [[128,64,128],[244,35,232],[70,70,70],[102,102,156],[190,153,153],[153,153,153],
+            [250,170,30],[220,220,0],[107,142,35],[152,251,152],[70,130,180],[220,20,60],
+            [255,0,0],[0,0,142],[0,0,70],[0,60,100],[0,80,100],[0,0,230],[119,11,32]]
+  ignore_index: 255
+  domains:
+    cityscapes:
+      root: /raid/workspace/datasets/cityscapes          # <-- change me
+      source:
+        mode: glob
+        image_glob: "leftImg8bit/{split}/*/*_leftImg8bit.png"
+        label_from_image: [["leftImg8bit/", "gtFine/"], ["_leftImg8bit.png", "_gtFine_labelIds.png"]]
+        domain_regex: "leftImg8bit/[^/]+/([^/]+)/"      # city (used to stratify the val split)
+      # Cityscapes labelIds -> 19 train ids; every other id -> ignore
+      label_map: {7: 0, 8: 1, 11: 2, 12: 3, 13: 4, 17: 5, 19: 6, 20: 7, 21: 8, 22: 9,
+                  23: 10, 24: 11, 25: 12, 26: 13, 27: 14, 28: 15, 31: 16, 32: 17, 33: 18}
+      splits:
+        train: {split: train, domains: all}
+        val:   {from: train, fraction: 0.1, per_domain: true}
+        test:  {split: val, domains: all}
+    idd:
+      root: /raid/workspace/datasets/idd_seg             # <-- change me (folder with leftImg8bit/ and masks/)
+      source:
+        mode: glob
+        image_glob: "leftImg8bit/{split}/*/*_leftImg8bit.png"
+        label_from_image: [["leftImg8bit/", "masks/"], ["_leftImg8bit.png", ".png"]]
+        domain_regex: "leftImg8bit/[^/]+/([^/]+)/"      # sequence (used to stratify the val split)
+      # IDD level-3 id -> Cityscapes train id. Unlisted ids (and 255) -> ignore:
+      #   1 drivable fallback, 8 autorickshaw, 12 vehicle fallback, 16 guard rail, 17 billboard,
+      #   21 obs-str-bar-fallback, 23 bridge  (no Cityscapes counterpart; guard rail and bridge
+      #   are also ignored in Cityscapes' own 19-class evaluation)
+      label_map:
+        0: 0      # road -> road
+        2: 1      # sidewalk -> sidewalk
+        13: 1     # curb -> sidewalk (Cityscapes labels curbs as sidewalk)
+        3: 9      # non-drivable fallback -> terrain
+        4: 11     # person
+        5: 12     # rider
+        6: 17     # motorcycle
+        7: 18     # bicycle
+        9: 13     # car
+        10: 14    # truck
+        11: 15    # bus
+        14: 3     # wall
+        15: 4     # fence
+        18: 7     # traffic sign
+        19: 6     # traffic light
+        20: 5     # pole
+        22: 2     # building
+        24: 8     # vegetation
+        25: 10    # sky
+      splits:
+        train: {split: train, domains: all}
+        val:   {from: train, fraction: 0.1, per_domain: true}
+        test:  {split: val, domains: all}
+    # Optional third task. BDD100K 10k semantic masks already use the 19 Cityscapes train ids.
+    # bdd100k:
+    #   root: /raid/workspace/datasets/bdd100k
+    #   source:
+    #     mode: glob
+    #     image_glob: "images/10k/{split}/*.jpg"
+    #     label_from_image: [["images/10k/", "labels/sem_seg/masks/"], [".jpg", ".png"]]
+    #   label_map: null
+    #   splits:
+    #     train: {split: train, domains: all}
+    #     val:   {from: train, fraction: 0.1, per_domain: false}
+    #     test:  {split: val, domains: all}
+
+transforms:
+  train:
+    - {name: Resize, size: 720, keep_ratio: true}
+    - {name: RandomScale, scale: [0.5, 2.0]}
+    - {name: RandomCrop, size: [512, 1024], cat_max_ratio: 0.75}
+    - {name: HorizontalFlip, p: 0.5}
+    - {name: ColorJitter, brightness: 0.3, contrast: 0.3, saturation: 0.3, hue: 0.02, p: 0.8}
+    - {name: GaussianBlur, kernel: 5, sigma: [0.1, 1.5], p: 0.2}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+  val:
+    - {name: Resize, size: 720, keep_ratio: true}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+  test:
+    - {name: Resize, size: 720, keep_ratio: true}
+    - {name: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+
+continual:
+  enabled: true
+  tasks: [[cityscapes], [idd]]          # add [bdd100k] to use the optional third task
+  valid_set: task
+
+model:
+  encoder: {name: segformer, pretrained: nvidia/mit-b2, freeze: true}
+  prototypes:
+    anchors: {source: clip, template: "a photo of a {} on a road"}
+
+loss:
+  ce: {ohem: {thresh: 0.7, min_kept: 100000}}
+
+# Same schedule for every task.
+train:
+  iters_per_task: null
+  epochs: 30
+  batch_size: 8
+  num_workers: 16
+  prefetch_factor: 4
+  log_interval: 200
+  optimizer:
+    name: adamw
+    lr: 6.0e-4
+    later_task_lr_mult: 1.0
+  scheduler: {name: poly, power: 1.0, warmup_iters: 500, warmup_every_task: true}
+
+eval:
+  batch_size: 4
+  num_workers: 8
+  every: 10
+  every_iters: null
+  print_class_table: true
+  track_seen_every_epoch: false
+
+viz:
+  tsne: {max_images: 60}
