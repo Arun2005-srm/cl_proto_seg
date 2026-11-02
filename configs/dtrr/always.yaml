@@ -1,0 +1,4 @@
+# replay every step for every class with a source (budget: dtrr.replay.budget_pixels per step)
+_base_: base.yaml
+experiment: {name: dtrr_always}
+dtrr: {mode: always}

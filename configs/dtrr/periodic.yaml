@@ -1,0 +1,4 @@
+# replay every dtrr.replay.period steps (budget_pixels x period each time: same average budget)
+_base_: base.yaml
+experiment: {name: dtrr_periodic}
+dtrr: {mode: periodic}

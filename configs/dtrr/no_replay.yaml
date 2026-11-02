@@ -1,0 +1,4 @@
+# no replay: the same model / LoRA schedule, DTRR off
+_base_: base.yaml
+experiment: {name: dtrr_no_replay}
+dtrr: {enabled: false}

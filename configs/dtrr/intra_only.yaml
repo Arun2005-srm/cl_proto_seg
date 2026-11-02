@@ -1,0 +1,4 @@
+# DTRR, current-task minor classes only
+_base_: base.yaml
+experiment: {name: dtrr_intra}
+dtrr: {intra: true, inter: false}

@@ -38,6 +38,92 @@ class FusionDecoder(nn.Module):
                for i, (p, f) in enumerate(zip(self.proj, feats))]
         return self.fuse(torch.cat(ups, dim=1))
 
+    # ---- pixel-level access for feature replay (DTRR). Everything up to the fuse norm is a
+    # per-pixel linear map of the per-scale encoder features upsampled to stride 4 (a 1x1 conv
+    # commutes with bilinear upsampling), so a pixel's decoder input u(p) = concat_i up(f_i)(p)
+    # fully determines z(p) once the norm statistics are fixed.
+    @staticmethod
+    def gather_inputs(feats, b: torch.Tensor, yx: torch.Tensor) -> torch.Tensor:
+        """u(p) [N, sum(ch)] at z-grid pixels (b [N] image index, yx [N, 2] row/col on the stride-4 grid),
+        identical to sampling F.interpolate(f_i, size_of_f_0) at those pixels."""
+        H, W = feats[0].shape[-2:]
+        gx = (yx[:, 1].float() + 0.5) * 2 / W - 1
+        gy = (yx[:, 0].float() + 0.5) * 2 / H - 1
+        out = []
+        for f in feats:
+            grid = torch.stack([gx, gy], -1).to(f.device, f.dtype).view(1, -1, 1, 2)
+            parts = []
+            for bi in b.unique().tolist():
+                sel = (b == bi).nonzero().flatten()
+                g = grid[:, sel.to(grid.device)]
+                v = F.grid_sample(f[bi:bi + 1], g, mode="bilinear", padding_mode="border", align_corners=False)
+                parts.append((sel, v[0, :, :, 0].t()))
+            col = torch.empty(len(b), f.shape[1], device=f.device, dtype=f.dtype)
+            for sel, v in parts:
+                col[sel.to(f.device)] = v
+            out.append(col)
+        return torch.cat(out, 1)
+
+    def norm_module(self) -> nn.Module:
+        """The fuse norm (GroupNorm / BatchNorm / Identity)."""
+        return self.fuse[1]
+
+    def forward_pixels(self, u: torch.Tensor, gn_stats: tuple[torch.Tensor, torch.Tensor] | None = None):
+        """z for decoder-input pixels u [N, sum(ch)] -> [N, D]. GroupNorm statistics are image-level, so
+        they are supplied (gn_stats = per-group mean, var of the norm input); BatchNorm uses its running
+        statistics; no norm is exact."""
+        chans = [p.in_channels for p in self.proj]
+        x = torch.cat([F.linear(ui, p.weight.flatten(1), p.bias)
+                       for ui, p in zip(u.split(chans, dim=1), self.proj)], 1)
+        conv1, norm, act, drop, conv2 = self.fuse
+        x = F.linear(x, conv1.weight.flatten(1), conv1.bias)
+        if isinstance(norm, nn.GroupNorm):
+            if gn_stats is None:
+                raise ValueError("forward_pixels with GroupNorm needs gn_stats")
+            mean, var = (t.to(x) for t in gn_stats)
+            G = norm.num_groups
+            xg = x.view(len(x), G, -1)
+            x = ((xg - mean.view(1, G, 1)) / (var.view(1, G, 1) + norm.eps).sqrt()).view_as(x)
+            x = x * norm.weight + norm.bias
+        elif isinstance(norm, nn.BatchNorm2d):
+            x = F.batch_norm(x, norm.running_mean, norm.running_var, norm.weight, norm.bias, False, 0.0, norm.eps)
+        x = act(x)
+        if self.training and drop.p > 0:
+            x = drop(x.t()[None, :, :, None])[0, :, :, 0].t()      # same channel dropout as one image
+        return F.linear(x, conv2.weight.flatten(1), conv2.bias)
+
+
+class GroupStatsTracker:
+    """EMA of the per-group mean / var at the input of the decoder's GroupNorm (forward pre-hook).
+    Read-only: it never changes the forward result."""
+
+    def __init__(self, norm: nn.Module, momentum: float = 0.1):
+        self.norm, self.momentum, self.mean, self.var, self.n = norm, momentum, None, None, 0
+        self.paused = False
+        self.cumulative = False     # True: plain average over every batch seen (momentum ignored)
+        self.handle = norm.register_forward_pre_hook(self._hook) if isinstance(norm, nn.GroupNorm) else None
+
+    @torch.no_grad()
+    def _hook(self, mod, inp):
+        if self.paused:
+            return
+        x = inp[0].detach().float()
+        xg = x.reshape(x.shape[0], mod.num_groups, -1)
+        m, v = xg.mean((0, 2)), xg.var(2, unbiased=False).mean(0)
+        self.n += 1
+        if self.mean is None:
+            self.mean, self.var = m, v
+        else:
+            a = 1.0 / self.n if self.cumulative else self.momentum
+            self.mean, self.var = (1 - a) * self.mean + a * m, (1 - a) * self.var + a * v
+
+    def stats(self):
+        return None if self.mean is None else (self.mean.clone(), self.var.clone())
+
+    def remove(self):
+        if self.handle is not None:
+            self.handle.remove()
+
 
 class ShiftEstimator(nn.Module):
     """g_phi: per-stage channel mean / std of encoder features -> s in R^shift_dim.

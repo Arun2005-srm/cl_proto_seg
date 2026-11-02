@@ -1,0 +1,51 @@
+# CPU smoke run of the BDD100K -> IDD protocol on the tiny local subset (data/bddidd_small):
+# small CNN encoder, frozen like MiT-B2 in the real run, with LoRA on its attention Linears.
+#   python tools/train.py --config configs/bdd_idd_smoke.yaml
+#   python tools/run_dtrr_smoke.py                       # DTRR proof-of-life checklist
+_base_: bdd_idd.yaml
+
+experiment:
+  name: bdd_idd_smoke
+  device: cpu
+  amp: false
+
+dataset:
+  domains:
+    bdd100k: {root: data/bddidd_small/bdd100k}
+    idd: {root: data/bddidd_small/idd}
+
+transforms:
+  train:
+    - {name: Resize, size: 96, keep_ratio: true}
+    - {name: RandomCrop, size: [80, 128]}
+    - {name: HorizontalFlip, p: 0.5}
+    - {name: Normalize}
+  val:
+    - {name: Resize, size: 96, keep_ratio: true}
+    - {name: Normalize}
+  test:
+    - {name: Resize, size: 96, keep_ratio: true}
+    - {name: Normalize}
+
+model:
+  encoder: {name: simple_cnn, freeze: true, pretrained: null}
+  lora: {targets: [query, key, value]}
+  prototypes:
+    anchors: {source: random}
+
+train:
+  epochs: 4
+  batch_size: 4
+  num_workers: 0
+  log_interval: 0
+  scheduler: {warmup_iters: 5}
+
+eval:
+  batch_size: 4
+  num_workers: 0
+  bootstrap: 50
+  print_class_table: false
+
+viz:
+  num_samples: 2
+  tsne: {enabled: false}

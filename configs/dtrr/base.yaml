@@ -1,0 +1,17 @@
+# DTRR on the BDD100K -> IDD protocol. Every ablation in this folder starts from here and
+# changes only the dtrr block, so they share data, schedule and model.
+#   python tools/train.py --config configs/dtrr/full.yaml --opts dataset.domains.bdd100k.root=... dataset.domains.idd.root=...
+#   python tools/run_dtrr_ablations.py                 # all of them (budget-matched), smoke data by default
+_base_: ../bdd_idd.yaml
+
+experiment:
+  name: dtrr_full
+
+model:
+  lora: {reset_per_task: true}       # per-task adapter, merged at task end (see README "LoRA across tasks")
+
+dtrr:
+  enabled: true
+  mode: adaptive
+  intra: true
+  inter: true

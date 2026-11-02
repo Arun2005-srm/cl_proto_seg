@@ -29,8 +29,13 @@ drift/losses.py              CE + Dice + hidden-class loss (+ shift anti-collaps
 drift/metrics.py             IoU / mIoU / fwIoU / BIoU / Dice / F1 / bootstrap CI / CL metrics
 drift/engine.py              trainer (phase 1) and frozen evaluation (phase 2)
 drift/viz.py, testing.py     curves, forgetting, t-SNE, samples, test report
-tools/                       eda, train, test, summarize_runs, make_camvid_lists, make_synthetic_cityscapes
-tests/                       unit tests, one or more per risk-register item
+drift/dtrr.py                DTRR: class stats, sketch memory, probe drift monitor, dual controller, replay
+drift/lora_audit.py          per-task LoRA checklist and gradient / weight / output proofs
+configs/dtrr/                DTRR ablations (no replay, always, periodic, intra, inter, full, fixed thresholds)
+configs/bdd_idd_smoke.yaml   BDD100K -> IDD on the tiny local subset, CPU
+tools/                       eda, train, test, summarize_runs, make_camvid_lists, make_synthetic_cityscapes,
+                             run_dtrr_smoke (proof-of-life checklist), run_dtrr_ablations
+tests/                       unit tests, one or more per risk-register item; test_dtrr.py for DTRR / LoRA
 ```
 
 ## Quick start
@@ -139,6 +144,30 @@ The method's other switches:
 
 The model prints a table of its modules at startup, with on/off state and
 parameter counts.
+
+## DTRR: drift-triggered reactive replay
+
+Optional (`dtrr.enabled: true`, see `configs/dtrr/`). It replays old-task classes from
+feature-level sketches only when the forgetting estimate exceeds its budget. No image of a
+finished task is stored. During each task:
+
+1. A probe set of 256 current-task pixels gives `eps_hat = mean ||norm(z_t) - norm(z_0)||` and
+   `delta_hat = max prototype shift` every K = 50 steps.
+2. Per class, `F_hat = max(F_meas, F_bound)`. `F_meas` is the rise in error of pseudo-features
+   sampled from the class sketch (mean and diagonal var of the decoder input) through the current
+   decoder and head. `F_bound` is the share of stored margins that the measured drift can flip.
+3. A dual variable per class, `lam <- clip(lam + alpha (F_hat - rho) + beta * staleness, 0, lam_max)`,
+   sets which classes are replayed and how much. There is no hand-tuned trigger, and `lam = 0`
+   means zero overhead.
+4. The replay gradient goes through a conflict gate (projection when it opposes the current
+   gradient), and the LoRA lr is braked by `1 / (1 + mean lam)`.
+
+Disabled, training is bit-identical to the code without it. Every stage asserts that it ran
+(probe self-test, memory save / reload / hash check, minor-class queues, controller use of
+`eps_hat`). `python tools/run_dtrr_smoke.py` prints a PASS/FAIL checklist.
+[docs/DTRR.md](docs/DTRR.md) has the full algorithm, the files it writes, the results template,
+the assumptions, and the LoRA audit, including what happens to LoRA between tasks
+(`model.lora.reset_per_task`).
 
 ## What gets reported
 

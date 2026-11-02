@@ -6,6 +6,7 @@ transformers versions (query/key/value vs q_proj/k_proj/v_proj).
 """
 from __future__ import annotations
 
+import contextlib
 import math
 import re
 
@@ -25,10 +26,11 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.merged = False
+        self.enabled = True      # False: base layer only (adapter-effect check); never set while merged
 
     def forward(self, x):
         out = self.base(x)
-        if self.merged:
+        if self.merged or not self.enabled:
             return out
         return out + (self.drop(x) @ self.lora_A.t() @ self.lora_B.t()) * self.scale
 
@@ -43,6 +45,22 @@ class LoRALinear(nn.Module):
         if self.merged:
             self.base.weight -= (self.lora_B @ self.lora_A).to(self.base.weight.dtype) * self.scale
             self.merged = False
+
+    def delta(self) -> torch.Tensor:
+        """W_lora = scale * B A, the adapter's contribution to the base weight."""
+        return (self.lora_B @ self.lora_A) * self.scale
+
+    @torch.no_grad()
+    def merge_and_reset(self, generator: torch.Generator | None = None):
+        """Fold the adapter into the base weight and start a fresh one (A re-drawn, B = 0):
+        the layer output is unchanged, the next task trains its own delta from zero."""
+        if self.merged:
+            raise RuntimeError("merge_and_reset on an already merged LoRA layer")
+        self.base.weight += self.delta().to(self.base.weight.dtype)
+        bound = 1 / math.sqrt(self.lora_A.shape[1])      # kaiming_uniform_(a=sqrt(5)) bound
+        a = torch.rand(self.lora_A.shape, generator=generator) * 2 * bound - bound
+        self.lora_A.copy_(a.to(self.lora_A))
+        self.lora_B.zero_()
 
 
 def linear_names(module: nn.Module) -> list[str]:
@@ -70,3 +88,22 @@ def set_lora_merged(module: nn.Module, merged: bool) -> None:
     for m in module.modules():
         if isinstance(m, LoRALinear):
             m.merge() if merged else m.unmerge()
+
+
+def lora_layers(module: nn.Module) -> list[LoRALinear]:
+    return [m for m in module.modules() if isinstance(m, LoRALinear)]
+
+
+@contextlib.contextmanager
+def lora_disabled(module: nn.Module):
+    """Run the base layers only (adapters bypassed) inside the block."""
+    layers = lora_layers(module)
+    if any(m.merged for m in layers):
+        raise RuntimeError("lora_disabled needs unmerged adapters")
+    for m in layers:
+        m.enabled = False
+    try:
+        yield
+    finally:
+        for m in layers:
+            m.enabled = True

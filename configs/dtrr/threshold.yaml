@@ -1,0 +1,6 @@
+# hand-tuned triggers instead of the dual controller: replay class c when staleness > s* or eps_hat > eps*
+_base_: base.yaml
+experiment: {name: dtrr_threshold}
+dtrr:
+  mode: threshold
+  threshold: {staleness: 200, eps: 0.05}

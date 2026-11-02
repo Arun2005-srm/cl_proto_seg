@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from .components import CosineHead, FusionDecoder, LinearHead, PrototypeGenerator, ShiftEstimator
 from .encoders import build_encoder
-from .lora import LoRALinear, inject_lora, linear_names, set_lora_merged
+from .lora import LoRALinear, inject_lora, linear_names, lora_layers, set_lora_merged
 
 
 def resolve_modules(mcfg) -> dict[str, bool]:
@@ -115,6 +115,7 @@ class DRIFT(nn.Module):
             for p in self.encoder.parameters():
                 p.requires_grad_(False)
         self.lora_layers: list[str] = []
+        self.lora_merges = 0          # per-task adapters folded into the base weights so far
         if self.flags.get("lora"):
             lc = mcfg.lora
             self.lora_layers = inject_lora(self.encoder, lc.targets, lc.rank, lc.alpha, lc.dropout)
@@ -156,7 +157,7 @@ class DRIFT(nn.Module):
         logits = self.head(z, protos)
         if out_size is not None:
             logits = F.interpolate(logits, size=out_size, mode="bilinear", align_corners=False)
-        return {"logits": logits, "z": z, "s": s, "stats": stats, "protos": protos}
+        return {"logits": logits, "z": z, "s": s, "stats": stats, "protos": protos, "feats": feats}
 
     def logits_from(self, z, protos, out_size=None):
         logits = self.head(z, protos)
@@ -187,6 +188,16 @@ class DRIFT(nn.Module):
     def merge_lora(self, merged: bool = True):
         set_lora_merged(self.encoder, merged)
 
+    def merge_and_reset_lora(self, seed: int = 0) -> int:
+        """End of a task (model.lora.reset_per_task): fold every adapter into its base weight
+        and attach a fresh one (B = 0), so the next task trains its own LoRA delta."""
+        g = torch.Generator().manual_seed(seed)
+        layers = lora_layers(self.encoder)
+        for m in layers:
+            m.merge_and_reset(g)
+        self.lora_merges += 1
+        return len(layers)
+
     def train(self, mode: bool = True):
         super().train(mode)
         # a frozen encoder runs in eval mode: no stochastic depth / dropout, fixed norm statistics.
@@ -215,6 +226,9 @@ class DRIFT(nn.Module):
         """State dict without frozen encoder weights (they come from `pretrained`)."""
         frozen = {f"encoder.{n}" for n, p in self.encoder.named_parameters()
                   if not p.requires_grad and "lora_" not in n} if self.encoder_frozen else set()
+        if self.lora_merges:   # merged adapters changed these base weights: they no longer match `pretrained`
+            frozen -= {f"encoder.{n}.base.{w}" for n, m in self.encoder.named_modules()
+                       if isinstance(m, LoRALinear) for w in ("weight", "bias")}
         return {k: v for k, v in self.state_dict().items() if k not in frozen}
 
     def module_report(self) -> str:

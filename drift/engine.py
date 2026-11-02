@@ -18,6 +18,8 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler
 from .config import Config, deep_merge
 from .data.datasets import SegDataset, build_splits, build_tasks, filter_domains
 from .data.transforms import build_transforms
+from .dtrr import DTRR, ClassTracker, class_pixel_stats, classify_classes, format_class_stats, write_class_stats
+from .lora_audit import LoRAAudit
 from .losses import DRIFTLoss
 from .metrics import (SegMetrics, bootstrap_miou, class_forgetting, continual_metrics, format_class_table,
                       miou_from_conf)
@@ -59,7 +61,9 @@ def class_presence(cfg, samples, cache_dir: str, num_workers: int) -> np.ndarray
     todo = [s for s in samples if s.key not in cache]
     if todo:
         ds = SegDataset(todo, cfg.dataset)
-        dl = DataLoader(_Presence(ds), batch_size=16, num_workers=num_workers)
+        # own generator: iterating a DataLoader draws from the global RNG, which made results
+        # depend on whether this cache already existed
+        dl = DataLoader(_Presence(ds), batch_size=16, num_workers=num_workers, generator=torch.Generator())
         rows = [r for b in dl for r in b.numpy()]
         for s, r in zip(todo, rows):
             cache[s.key] = np.nonzero(r)[0].tolist()
@@ -89,7 +93,7 @@ def _collate(batch, ignore_index: int = 255):
 
 
 def make_loader(cfg, samples, split: str, shuffle: bool, batch_size: int, num_workers: int, drop_last=False,
-                drop_classes=()):
+                drop_classes=(), generator=None):
     tf = build_transforms(cfg.transforms[split], cfg.dataset.ignore_index)
     ds = SegDataset(samples, cfg.dataset, transform=tf, drop_classes=drop_classes)
     sampler = None
@@ -101,7 +105,7 @@ def make_loader(cfg, samples, split: str, shuffle: bool, batch_size: int, num_wo
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, sampler=sampler, num_workers=num_workers,
                       pin_memory=torch.cuda.is_available(), drop_last=drop_last and len(ds) >= batch_size,
                       collate_fn=functools.partial(_collate, ignore_index=cfg.dataset.ignore_index),
-                      persistent_workers=num_workers > 0, **extra)
+                      persistent_workers=num_workers > 0, generator=generator, **extra)
 
 
 # ============================================================================ optim
@@ -281,6 +285,19 @@ class Trainer:
         self.task_hidden = None
         self.hide_candidates = None
 
+        # instrumentation (read-only: no RNG, no parameter change) and DTRR (cfg.dtrr.enabled)
+        self.tracker = ClassTracker(self.C)
+        self.audit = LoRAAudit(self.model, cfg)
+        self.class_info: list[dict] = []
+        self.mem_counts = None
+        self.last_confs: dict = {}
+        self.task_step = 0
+        dc = cfg.get("dtrr") or {}
+        self.dtrr = DTRR(cfg, self) if dc.get("enabled", False) else None
+        if self.dtrr is not None:
+            print(f"[dtrr] enabled: mode {dc.get('mode', 'adaptive')}, intra {dc.get('intra', True)}, "
+                  f"inter {dc.get('inter', True)}, K={dc.interval}")
+
     # ------------------------------------------------------------------ helpers
     def _task_cfg(self, t: int) -> Config:
         ov = self.cfg.continual.get("task_overrides", {}) or {}
@@ -330,10 +347,19 @@ class Trainer:
         t0 = time.time()
         opt.zero_grad(set_to_none=True)
         max_it = tc.get("max_iters_per_epoch")
+        t_data = t_comp = 0.0
+        s_mean = s_std = s_low = 0.0
+        s_n = 0
+        tick = time.time()
         for it, b in enumerate(loader):
             if max_it and it >= max_it:
                 break
+            t_data += time.time() - tick
+            tick = time.time()
             x, y = b["image"].to(self.device, non_blocking=True), b["label"].to(self.device, non_blocking=True)
+            if self.task_step == 0 and it == 0:
+                self.audit.capture_batch(x)
+                self.input_shape = tuple(x.shape)
             allowed = self._allowed(cfg, t, y)
             th = self.task_hidden
             if th is not None and np.random.rand() >= float(cfg.loss.hidden.get("iter_prob", 1.0)):
@@ -349,8 +375,27 @@ class Trainer:
                     raise FloatingPointError("more than 20 non-finite losses in one epoch; lower the lr")
                 continue
             hidden_iters += int(hidden.any())
+            received = torch.zeros(self.C, dtype=torch.bool)       # classes that get gradient this step
+            u = y.unique()
+            received[u[u < self.C].cpu()] = True
+            received &= allowed.cpu()
+            if self.dtrr is not None:
+                self.dtrr.observe(out, y, received)
+            if out.get("s") is not None and out["s"].shape[0] > 1:
+                sd = out["s"].detach().float()
+                s_mean += float(sd.mean())
+                s_std += float(sd.std(0).mean())
+                s_low += float((sd.std(0) < float((cfg.loss.get("shift_var") or {}).get("target_std", 1.0))).float().mean())
+                s_n += 1
+            self.audit.check_forward(out)
             scaler.scale(loss / tc.accum_steps).backward()
+            self.audit.after_backward(scaler)
+            if it == 0:
+                self.encoder_backward = any(p.grad is not None and bool(p.grad.abs().sum() > 0)
+                                            for p in self.model.encoder.parameters() if p.requires_grad)
             if (it + 1) % tc.accum_steps == 0:
+                if self.dtrr is not None:
+                    self.dtrr.before_step(opt, scaler)
                 if tc.grad_clip:
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups for p in g["params"]], tc.grad_clip)
@@ -358,6 +403,11 @@ class Trainer:
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
                 sched.step()
+                self.tracker.update(received)
+                self.task_step += 1
+                if self.dtrr is not None:
+                    self.dtrr.after_step(opt, time.time() - tick)
+                self.audit.on_step(self.task_step)
             tot += loss.item()
             n += 1
             correct += c_ok
@@ -366,11 +416,17 @@ class Trainer:
                 comps[k] = comps.get(k, 0.0) + v
             if tc.log_interval and (it + 1) % tc.log_interval == 0:
                 print(f"    it {it + 1:5d}/{len(loader)}  loss {tot / n:.4f}  acc {100 * correct / max(count, 1):.2f}"
-                      f"  lr {opt.param_groups[0]['lr']:.2e}  {(time.time() - t0) / (it + 1):.2f}s/it", flush=True)
+                      f"  lr {opt.param_groups[0]['lr']:.2e}  {(time.time() - t0) / (it + 1):.2f}s/it"
+                      f" (data {t_data / (it + 1):.2f}, compute {t_comp / (it + 1):.2f})", flush=True)
+            t_comp += time.time() - tick
+            tick = time.time()
         if skipped:
             print(f"    [warn] skipped {skipped} iterations with a non-finite loss")
         return {"loss": tot / max(n, 1), "acc": correct / max(count, 1),
-                **{f"loss_{k}": v / max(n, 1) for k, v in comps.items()}, "hidden_iter_frac": hidden_iters / max(n, 1)}
+                **{f"loss_{k}": v / max(n, 1) for k, v in comps.items()}, "hidden_iter_frac": hidden_iters / max(n, 1),
+                "data_s_per_it": t_data / max(n, 1), "compute_s_per_it": t_comp / max(n, 1),
+                "s_mean": s_mean / max(s_n, 1), "s_batch_std": s_std / max(s_n, 1),
+                "s_dims_below_target": s_low / max(s_n, 1)}
 
     @torch.no_grad()
     def _pixel_feats(self, model, loader, max_pix_per_img: int, seed: int):
@@ -437,6 +493,7 @@ class Trainer:
     def write_memory(self, cfg, t):
         """End of task: class means of z(p) per observed class, with the mean s as the slot key.
         Absent classes are untouched."""
+        self.mem_counts = None
         if not self.model.uses_memory:
             return
         self.model.eval()
@@ -465,6 +522,7 @@ class Trainer:
             if self.task_hidden is not None and not cfg.loss.hidden.get("write_hidden", True):
                 cnt[self.task_hidden.to(self.device)] = 0
             key = s_sum / s_n if s_sum is not None else None
+            self.mem_counts = cnt.float().cpu() if self.mem_counts is None else self.mem_counts + cnt.float().cpu()
             self.model.prototypes.memory_write((sums / cnt.clamp(min=1)[:, None]).float(), cnt.float(), key)
         print(f"[memory] T{t}: wrote {int((self.task_valid[t]).sum())} classes from {len(self.tasks[t])} domain(s); "
               f"{int(self.model.memory_mask().sum())}/{self.C} classes in memory, "
@@ -482,6 +540,7 @@ class Trainer:
             r = evaluate(self.model, vl, cfg, self.device, with_loss=False, collect_s=j <= t)
             self.R[t, j] = r["mIoU"]
             confs[j] = (np.asarray(r["confusion"]), np.asarray(r["unknown_fn"]))
+            self.last_confs = confs
             if "s" in r:
                 s_all.append(r["s"])
                 d_all.append(torch.full((len(r["s"]),), j))       # task id as the domain label
@@ -529,6 +588,8 @@ class Trainer:
             warm = cfg.train.scheduler.get("warmup_iters", 0) if (t == 0 or cfg.train.scheduler.get("warmup_every_task")) else 0
             sched = build_scheduler(opt, cfg.train.scheduler, max(1, iters // cfg.train.accum_steps), warm)
             scaler = torch.amp.GradScaler("cuda", enabled=self.amp and self.amp_dtype == torch.float16)
+            self.task_step = 0
+            self.tracker.reset_task()
             self.model.mark_seen(self.task_valid[t])
             self.task_hidden = None
             # classes that may be hidden: valid here and not dominant (present in <= max_presence of the
@@ -545,11 +606,14 @@ class Trainer:
                 every = max(1, round(int(cfg.eval.every_iters) / max(1, ipe)))
             print(f"\n=== Task {t + 1}/{T}  [{', '.join(self.tasks[t][:6])}{'...' if len(self.tasks[t]) > 6 else ''}]"
                   f"  train {len(tr)} imgs, {epochs} epochs x {ipe} it, lr {cfg.train.optimizer.lr * lr_scale:.2e}{hid} ===")
+            self._task_start_report(cfg, t, tr, train_loader, opt, scaler)
 
             for ep in range(epochs):
                 self.global_epoch += 1
                 t0 = time.time()
                 trs = self.train_epoch(cfg, t, train_loader, opt, sched, scaler)
+                if ep == 0:
+                    self._speed_report(cfg, t, trs)
                 row = {"task": t, "epoch": ep + 1, "global_epoch": self.global_epoch,
                        "lr": opt.param_groups[0]["lr"], **{f"train_{k}": v for k, v in trs.items()}}
                 val_loader = self._val_loader(cfg, t)
@@ -575,10 +639,16 @@ class Trainer:
                 self._save_history()
                 self.save_checkpoint("last.pt", t)
 
+            self.audit.task_end(self.task_step)
+            if self.dtrr is not None:
+                self.dtrr.end_training()
             self.compensate_drift(cfg, t, old_model)
             del old_model
             self.write_memory(cfg, t)
+            if self.dtrr is not None:
+                self.dtrr.end_task(cfg, t, tr, self.mem_counts)
             self.evaluate_stage(cfg, t)
+            self._class_report(cfg, t)
             cm = continual_metrics(self.R[: t + 1, : t + 1])
             cmc = continual_metrics(self.R_common[: t + 1, : t + 1])
             cf = class_forgetting(self.Rc[: t + 1])
@@ -588,6 +658,14 @@ class Trainer:
                   f" | avg seen {100 * cm['avg_final']:.2f} | forgetting {100 * cm['avg_forgetting']:.2f}"
                   f" (common classes {100 * cmc['avg_forgetting']:.2f}, class-level {100 * cf['avg_class_forgetting']:.2f})"
                   f" | BWT {100 * cm['BWT']:.2f}")
+            rare = self.rare_class_iou(t)
+            if rare is not None:
+                extra = ""
+                if self.dtrr is not None and self.dtrr.report["tasks"]:
+                    r = self.dtrr.report["tasks"][-1]
+                    extra = (f" | replay on {100 * r['replay_frac']:.1f}% of steps, "
+                             f"{100 * r['replay_compute_frac']:.1f}% of step time")
+                print(f"[cl] after T{t}: rare-class IoU {100 * rare[0]:.2f} over {', '.join(rare[1])}{extra}")
             for name in [n for n in self.splits if n.startswith("val_") or (n == "test" and cfg.eval.test_after_each_task)]:
                 tl = make_loader(cfg, self.splits[name], "test", False, cfg.eval.batch_size, cfg.eval.num_workers)
                 te = evaluate(self.model, tl, cfg, self.device, with_loss=False)
@@ -596,8 +674,72 @@ class Trainer:
                 print(f"[cl] after T{t}: {name} mIoU {100 * te['mIoU']:.2f}  BIoU {100 * te['BIoU']:.2f}")
             self.save_checkpoint(f"task{t}.pt", t)
             self._save_history()
+            if cfg.model.get("lora", {}).get("reset_per_task", False) and self.model.lora_layers and t + 1 < T:
+                n = self.model.merge_and_reset_lora(seed=int(cfg.experiment.seed) + t)
+                print(f"[lora] T{t} adapter merged into the base weights of {n} layers; a fresh adapter (B = 0) "
+                      f"trains T{t + 1}")
+        if self.dtrr is not None:
+            self.dtrr.final_checks()
         self.cfg = cfg0
         return self.history
+
+    # ------------------------------------------------------------------ instrumentation
+    def _task_start_report(self, cfg, t, tr, train_loader, opt, scaler):
+        """Class statistics of the task's labels, the LoRA checklist, and DTRR's probe / memory checks."""
+        stats = class_pixel_stats(cfg, tr, self.task_drop[t], cfg.train.num_workers)
+        mc = (cfg.get("dtrr") or {}).get("minor") or {}
+        info = classify_classes(stats, float(mc.get("percentile", 25)), float(mc.get("min_share", 0.005)))
+        self.class_info.append({"stats": stats, "info": info})
+        write_class_stats(os.path.join(self.run_dir, f"class_stats_T{t}.json"), t, self.classes, stats, info)
+        print(f"[classes] T{t} label pass over {stats['n_images']} training images (labels only); minor = q_c < "
+              f"{100 * info['q_threshold']:.3f}% (p25) or < {100 * float(mc.get('min_share', 0.005)):.1f}%:\n"
+              + format_class_stats(self.classes, stats, info))
+        crop = next((o.get("size") for o in cfg.transforms.train if o.get("name") in ("RandomCrop", "CenterCrop")), None)
+        enc_bwd = any(p.requires_grad for p in self.model.encoder.parameters())
+        what = ("LoRA only" if self.model.encoder_frozen else "full encoder") if enc_bwd else "NO (encoder frozen, no LoRA)"
+        print(f"[speed] T{t}: batch {cfg.train.batch_size} x accum {cfg.train.accum_steps}, train crop {crop}, "
+              f"encoder backward: {what}, amp {self.amp} ({str(self.amp_dtype).split('.')[-1]}), "
+              f"workers {cfg.train.num_workers}")
+        self.audit.task_start(t, opt, scaler, bool(cfg.model.get("lora", {}).get("reset_per_task", False)))
+        if self.dtrr is not None:
+            self.dtrr.start_task(cfg, t, tr, train_loader, stats, info)
+
+    def _speed_report(self, cfg, t, trs):
+        shape = getattr(self, "input_shape", None)
+        print(f"[speed] T{t} epoch 1: input {shape}, {trs['data_s_per_it'] + trs['compute_s_per_it']:.3f} s/it = "
+              f"data wait {trs['data_s_per_it']:.3f} + compute {trs['compute_s_per_it']:.3f}; encoder backward ran: "
+              f"{'yes' if getattr(self, 'encoder_backward', False) else 'no'}")
+        sv = float((cfg.loss.get("shift_var") or {}).get("target_std", 1.0))
+        print(f"[shift] T{t} epoch 1: s mean {trs['s_mean']:+.3f}, per-dim std of s across the batch "
+              f"{trs['s_batch_std']:.3f} (target_std {sv:.2f}; {100 * trs['s_dims_below_target']:.0f}% of dims below "
+              f"it), shift_var term {trs.get('loss_shift_var', float('nan')):.5f}")
+
+    def _class_report(self, cfg, t):
+        """Per class: training pixels, steps with gradient, staleness, memory-slot source pixels, and on the
+        task's val split GT / predicted pixel counts and IoU (finds classes that are never predicted)."""
+        if not cfg.get("audit", {}).get("class_table", True):
+            return
+        info = self.class_info[t]
+        conf = self.last_confs.get(t, (None,))[0]
+        gt = conf.sum(1) if conf is not None else np.zeros(self.C)
+        pred = conf.sum(0) if conf is not None else np.zeros(self.C)
+        tp = np.diag(conf) if conf is not None else np.zeros(self.C)
+        tk = self.tracker
+        lines = [f"    {'class':16s} {'train px':>10s} {'minor':>5s} {'seen':>5s} {'max stale':>9s} {'mem src px':>10s} "
+                 f"{'val GT px':>10s} {'val pred px':>11s} {'IoU':>6s}"]
+        never = []
+        for c in range(self.C):
+            iou = tp[c] / max(gt[c] + pred[c] - tp[c], 1) if gt[c] > 0 else float("nan")
+            mem = int(self.mem_counts[c]) if self.mem_counts is not None else 0
+            iou_s = "-" if np.isnan(iou) else f"{100 * iou:.2f}"
+            lines.append(f"    {self.classes[c]:16s} {int(info['stats']['pixels'][c]):10d} "
+                         f"{'yes' if info['info']['minor'][c] else '-':>5s} {int(tk.times_seen[c]):5d} "
+                         f"{int(tk.max_stale[c]):9d} {mem:10d} {int(gt[c]):10d} {int(pred[c]):11d} {iou_s:>6s}")
+            if gt[c] > 0 and pred[c] == 0:
+                never.append(self.classes[c])
+        print(f"[classes] T{t} end (val = this task's val split):\n" + "\n".join(lines))
+        if never:
+            print(f"[classes] T{t}: present in val but NEVER predicted: {', '.join(never)}")
 
     # ------------------------------------------------------------------ logging
     def _print_epoch(self, r, epochs, t, T, cfg):
@@ -619,6 +761,16 @@ class Trainer:
         if "IoU_per_class" in r and cfg.eval.print_class_table:
             print(format_class_table(r, self.classes, cols=("IoU", "F1", "BIoU")))
 
+    def rare_class_iou(self, t):
+        """Mean IoU (pooled val of tasks <= t, after task t) over classes that were minor in any task <= t."""
+        if t >= len(self.class_info):
+            return None
+        minor = np.logical_or.reduce([ci["info"]["minor"] for ci in self.class_info[: t + 1]])
+        vals = self.Rc[t][minor]
+        if not minor.any() or np.all(np.isnan(vals)):
+            return None
+        return float(np.nanmean(vals)), [self.classes[c] for c in np.nonzero(minor)[0]]
+
     def _done_tasks(self):
         return int((~np.isnan(np.diag(self.R))).sum())
 
@@ -629,6 +781,9 @@ class Trainer:
         out = continual_metrics(self.R[:d, :d])
         out["common_classes"] = continual_metrics(self.R_common[:d, :d])
         out.update(class_forgetting(self.Rc[:d]))
+        rare = self.rare_class_iou(d - 1)
+        if rare is not None:
+            out["rare_class_IoU"], out["rare_classes"] = rare
         return out
 
     def _save_history(self):
