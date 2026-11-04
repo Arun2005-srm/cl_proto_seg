@@ -1,5 +1,5 @@
 """Prediction images from a checkpoint, including one written mid-training (last.pt is saved
-after every epoch): image | ground truth | prediction | prediction blended over the image.
+after every epoch): image | ground truth | prediction | prediction blended over the image | error map.
 
     python tools/predict_overlay.py --run outputs/bdd_idd_dtrr/<timestamp>
     python tools/predict_overlay.py --run outputs/bdd_idd_dtrr/<timestamp> --domain idd --split test --num 16
@@ -43,6 +43,8 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.5, help="prediction opacity in the overlay")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0, help="which images: a fixed random pick per seed")
+    ap.add_argument("--mask-ignore", action="store_true",
+                    help="grey out pixels whose ground truth is ignore (e.g. the ego bonnet in BDD100K) in the overlay")
     ap.add_argument("--opts", nargs="*", default=[], help="config overrides, e.g. dataset roots")
     args = ap.parse_args()
 
@@ -83,15 +85,22 @@ def main():
             img = denormalize(item["image"], mean, std)
             pc = colorize(pred, pal, ign)
             blend = (img * (1 - args.alpha) + pc * args.alpha).astype(np.uint8)
+            if args.mask_ignore:
+                blend[y == ign] = (img[y == ign] * 0.35 + 90).astype(np.uint8)
+            # error map: correct green, wrong red, ignore (not scored) dark grey
+            err = np.full((*y.shape, 3), 40, dtype=np.uint8)
+            err[(y != ign) & (pred == y)] = (60, 170, 90)
+            err[(y != ign) & (pred != y)] = (220, 50, 50)
             name = f"{dom}_{args.split}_{i:02d}"
             Image.fromarray(blend).save(os.path.join(out_dir, f"{name}_overlay.png"))
 
             valid = y != ign
             acc = float((pred[valid] == y[valid]).mean()) if valid.any() else float("nan")
             present = [c for c in np.unique(np.concatenate([y[valid], pred.ravel()])) if c < len(classes)]
-            fig, ax = plt.subplots(1, 4, figsize=(22, 4.2))
-            for a, im, title in zip(ax, (img, colorize(y, pal, ign), pc, blend),
-                                    ("image", "ground truth", "prediction", f"overlay (alpha {args.alpha})")):
+            fig, ax = plt.subplots(1, 5, figsize=(27, 4.2))
+            for a, im, title in zip(ax, (img, colorize(y, pal, ign), pc, blend, err),
+                                    ("image", "ground truth (black = ignore, not scored)", "prediction",
+                                     f"overlay (alpha {args.alpha})", "errors: green ok / red wrong / grey ignore")):
                 a.imshow(im)
                 a.set_title(title)
                 a.axis("off")

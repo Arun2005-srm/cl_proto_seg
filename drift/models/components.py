@@ -46,21 +46,26 @@ class FusionDecoder(nn.Module):
     def gather_inputs(feats, b: torch.Tensor, yx: torch.Tensor) -> torch.Tensor:
         """u(p) [N, sum(ch)] at z-grid pixels (b [N] image index, yx [N, 2] row/col on the stride-4 grid),
         identical to sampling F.interpolate(f_i, size_of_f_0) at those pixels."""
+        dev = feats[0].device
+        b, yx = b.to(dev), yx.to(dev)
         H, W = feats[0].shape[-2:]
-        gx = (yx[:, 1].float() + 0.5) * 2 / W - 1
-        gy = (yx[:, 0].float() + 0.5) * 2 / H - 1
+        B = feats[0].shape[0]
+        # one grid_sample per scale for the whole batch: pixels of image i in row i of a padded grid
+        order = torch.argsort(b, stable=True)
+        bs = b[order]
+        counts = torch.bincount(bs, minlength=B)
+        start = torch.cumsum(counts, 0) - counts
+        pos = torch.arange(len(bs), device=dev) - start[bs]
+        K = int(counts.max()) if len(bs) else 0
+        g = torch.zeros(B, max(K, 1), 2, device=dev)
+        g[bs, pos, 0] = (yx[order, 1].float() + 0.5) * 2 / W - 1
+        g[bs, pos, 1] = (yx[order, 0].float() + 0.5) * 2 / H - 1
         out = []
         for f in feats:
-            grid = torch.stack([gx, gy], -1).to(f.device, f.dtype).view(1, -1, 1, 2)
-            parts = []
-            for bi in b.unique().tolist():
-                sel = (b == bi).nonzero().flatten()
-                g = grid[:, sel.to(grid.device)]
-                v = F.grid_sample(f[bi:bi + 1], g, mode="bilinear", padding_mode="border", align_corners=False)
-                parts.append((sel, v[0, :, :, 0].t()))
-            col = torch.empty(len(b), f.shape[1], device=f.device, dtype=f.dtype)
-            for sel, v in parts:
-                col[sel.to(f.device)] = v
+            v = F.grid_sample(f, g.to(f.dtype).view(B, -1, 1, 2), mode="bilinear", padding_mode="border",
+                              align_corners=False)                        # [B, C, K, 1]
+            col = torch.empty(len(b), f.shape[1], device=dev, dtype=f.dtype)
+            col[order] = v[bs, :, pos, 0]
             out.append(col)
         return torch.cat(out, 1)
 

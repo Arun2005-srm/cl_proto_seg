@@ -28,7 +28,6 @@ import json
 import math
 import os
 import time
-from collections import deque
 
 import numpy as np
 import torch
@@ -195,6 +194,29 @@ def class_cells(y: torch.Tensor, h: int, w: int, C: int, ign: int):
             cells = torch.stack([px[:, 0], px[:, 1] * h // H, px[:, 2] * w // W], 1)
             out[c] = cells.unique(dim=0)
     return out, lz
+
+
+class RingQueue:
+    """FIFO of the last `size` decoder-input features of one class, kept on the training device (fp16)."""
+
+    def __init__(self, size: int, dim: int, device):
+        self.buf = torch.zeros(size, dim, dtype=torch.float16, device=device)
+        self.n, self.ptr = 0, 0
+
+    def __len__(self):
+        return self.n
+
+    def push(self, u: torch.Tensor):
+        u = u[-len(self.buf):].to(self.buf)
+        k = len(u)
+        idx = (self.ptr + torch.arange(k, device=self.buf.device)) % len(self.buf)
+        self.buf[idx] = u
+        self.ptr = (self.ptr + k) % len(self.buf)
+        self.n = min(self.n + k, len(self.buf))
+
+    def sample(self, k: int, gen: torch.Generator) -> torch.Tensor:
+        idx = torch.randint(self.n, (k,), generator=gen).to(self.buf.device)
+        return self.buf[idx].float()
 
 
 # ============================================================================ sketch store
@@ -543,7 +565,9 @@ class DTRR:
         self.task_report["prev_classes_present"] = prev_ok
 
         # per-task online state
-        self.queues = {c: deque(maxlen=int(dc.queue.size)) for c in torch.nonzero(self.minor).flatten().tolist()}
+        du = sum(self.model.encoder.out_channels)
+        self.queues = {c: RingQueue(int(dc.queue.size), du, self.device)
+                       for c in torch.nonzero(self.minor).flatten().tolist()}
         self.pushes = torch.zeros(self.C, dtype=torch.long)
         self.online = {}                       # class -> (mean, var) EMA of u
         self.last_stats_key = None
@@ -560,6 +584,7 @@ class DTRR:
         self.curve_rows = []
         self.ctrl_rows = []
         self.lam_bar = 0.0
+        self.lam_bar_inter = 0.0
 
         # probe set + z0 + self-test
         from .engine import make_loader
@@ -616,22 +641,33 @@ class DTRR:
         if out.get("stats") is not None:
             self.last_stats_key = out["stats"].detach().float().mean(0).cpu()
         k = int(self.dc.online.pixels_per_class_step)
+        kq = int(self.dc.queue.push_per_step)
         mom = float(self.dc.online.momentum)
+        sel, owner = [], []
         for c in torch.nonzero(received).flatten().tolist():
             idx = cells.get(c)
             if idx is None or len(idx) == 0:
                 continue
-            idx = idx[torch.randperm(len(idx), generator=self.gen)[:max(k, int(self.dc.queue.push_per_step))].to(idx.device)]
-            u = FusionDecoder.gather_inputs(feats, idx[:, 0], idx[:, 1:]).float()
-            m, v = u.mean(0).cpu(), u.var(0, unbiased=False).cpu()
+            n = min(len(idx), kq if c in self.queues else k)
+            pick = torch.randperm(len(idx), generator=self.gen)[:n].to(idx.device)
+            sel.append(idx[pick])
+            owner.append((c, n))
+        if not sel:
+            return
+        idx = torch.cat(sel)
+        u = FusionDecoder.gather_inputs(feats, idx[:, 0], idx[:, 1:]).float()   # one gather for every class
+        off = 0
+        for c, n in owner:
+            uc = u[off:off + n]
+            off += n
+            m, v = uc.mean(0), uc.var(0, unbiased=False)
             if c in self.online:
                 om, ov = self.online[c]
                 self.online[c] = ((1 - mom) * om + mom * m, (1 - mom) * ov + mom * v)
             else:
                 self.online[c] = (m, v)
             if c in self.queues:
-                for row in u[: int(self.dc.queue.push_per_step)].half().cpu():
-                    self.queues[c].append(row)
+                self.queues[c].push(uc)
                 self.pushes[c] += 1
 
     def current_lam(self) -> torch.Tensor:
@@ -681,9 +717,7 @@ class DTRR:
             else:
                 kq = k if from_queue else 0
             if kq:
-                q = self.queues[c]
-                idx = torch.randint(len(q), (kq,), generator=self.gen).tolist()
-                u = torch.stack([q[i] for i in idx]).float()
+                u = self.queues[c].sample(kq, self.gen)
                 groups.append((u, c, self.last_stats_key, self.gn.stats()))
             if k - kq:
                 e = self.store.pick(c, self.gen)
@@ -696,6 +730,10 @@ class DTRR:
         lam = self.current_lam()
         n = self._budget(lam) if lam.sum() > 0 else 0
         self.lam_bar = float(lam[lam > 0].mean()) if (lam > 0).any() else 0.0
+        # the LoRA brake protects old tasks from encoder drift: only old-task (inter) classes drive it,
+        # replaying the current task's rare classes must not slow the current task's encoder adaptation
+        inter = lam * self.store.class_mask(self.C).float()
+        self.lam_bar_inter = float(inter[inter > 0].mean()) if (inter > 0).any() else 0.0
         if n <= 0:
             return
         t0 = time.time()
@@ -732,10 +770,10 @@ class DTRR:
         self.task_step += 1
         self.total_steps += 1
         self.step_time += step_time
-        if self.dc.replay.get("lora_brake", True) and self.lam_bar > 0:
+        if self.dc.replay.get("lora_brake", True) and self.lam_bar_inter > 0:
             for g in opt.param_groups:
                 if g["name"].startswith("lora"):
-                    g["lr"] = g["lr"] / (1.0 + self.lam_bar)
+                    g["lr"] = g["lr"] / (1.0 + self.lam_bar_inter)
         if self.task_step == 1 or self.task_step % int(self.dc.interval) == 0:
             self.monitor()
 
@@ -751,8 +789,7 @@ class DTRR:
                 gn = (entry["gn_mean"], entry["gn_var"]) if entry.get("gn_mean") is not None else None
                 sk = entry.get("stats_key")
             else:
-                q = self.queues[c]
-                u = torch.stack([q[i] for i in torch.randint(len(q), (n,), generator=self.gen).tolist()]).float()
+                u = self.queues[c].sample(n, self.gen)
                 gn, sk = self.gn.stats(), self.last_stats_key
             z = self.model.decoder.forward_pixels(u.to(self.device), gn)
             lg = self._logits(z, self._s_from_stats(sk), protos)
